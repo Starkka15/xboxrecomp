@@ -1224,6 +1224,34 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         linear_addr += 4;
                     }
                 }
+                { /* DBG: RECOMP_APU_ADPCM_CHECK logs blocks whose header is not ADPCM (step index > 88). */
+                    static int on = -1, logged;
+                    if (on < 0) on = apu_env_on("RECOMP_APU_ADPCM_CHECK");
+                    if (on && logged < 40) {
+                        const uint8_t *h = (const uint8_t *)adpcm_block;
+                        unsigned c2;
+                        for (c2 = 0; c2 < channels; c2++)
+                            if (h[c2 * 4 + 2] > 88 || h[c2 * 4 + 3] != 0)
+                                break;
+                        if (c2 < channels || block_index == 0) {
+                            logged++;
+                            fprintf(stderr, "[ADPCM] v%u %s block %u ba %08X ch %u spb %u: %02X %02X %02X %02X %02X %02X %02X %02X | %02X %02X %02X %02X\n",
+                                    v, c2 < channels ? "BAD" : "ok", block_index, ba, channels, samples_per_block,
+                                    h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7], h[36], h[37], h[38], h[39]);
+                            if (!stream) {
+                                extern const volatile uint8_t *xbox_PhysRamNameMap(void);
+                                extern const volatile uint8_t *xbox_ContiguousPageMap(void);
+                                uint32_t pa = (uint32_t)get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF,
+                                                                     ba + block_index * (uint32_t)block_size) & 0x0FFFFFFFu;
+                                const uint8_t *w = g_apu_ram_ptr + 0x80000000u + pa;
+                                fprintf(stderr, "[ADPCM]   pa %08X named %u contig %u; window: %02X %02X %02X %02X %02X %02X %02X %02X\n",
+                                        pa, pa < (64u << 20) ? xbox_PhysRamNameMap()[pa >> 12] : 9,
+                                        pa < (64u << 20) ? xbox_ContiguousPageMap()[pa >> 12] : 9,
+                                        w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+                            }
+                        }
+                    }
+                }
                 adpcm_decode_block(adpcm_decoded, (uint8_t *)adpcm_block,
                                    block_size, channels);
                 adpcm_block_index = block_index;

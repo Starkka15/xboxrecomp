@@ -1476,6 +1476,12 @@ VOID __stdcall xbox_AvSendTVEncoderOption(
         *Result = AV_PACK_HDTV
                 | (AV_STANDARD_NTSC_M << AV_STANDARD_SHIFT)
                 | AV_REFRESH_60Hz;
+        /* The real answer also carries the user's EEPROM video flags:
+         * widescreen 0x10000, 720p 0x20000, 1080i 0x40000, 480p 0x80000.
+         * D3D's mode search refuses a widescreen mode, and any HDTV one,
+         * that this word does not allow -- Spyro's Reset into 16:9 failed
+         * with E_FAIL and left the device with no render target. */
+        *Result |= xbox_VideoSetting() & 0x000F0000u;
         break;
 
     case AV_OPTION_QUERY_MODE:

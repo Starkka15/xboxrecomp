@@ -13,6 +13,7 @@
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
 #include "../input/xinput_xbox.h"   /* xbox_InputSetState: rumble */
+#include "../input/mkb_input.h"     /* hot-plug: keyboard presses */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -434,6 +435,9 @@ static int     g_ctrl_sent_[USB_GAMEPAD_MAX];
 /* Pads plugged in so far, in port order. */
 static int s_plugged_pads;
 
+/* Pad 1 is unplugged because the host controller behind it went away. */
+static int s_pad_unplugged;
+
 /* Which pad an endpoint descriptor talks to: by its function address, and
  * address 0 -- the default address a device answers before SET_ADDRESS --
  * is the plugged pad that has not been given one yet. Pads are plugged one
@@ -443,7 +447,7 @@ static int ohci_pad_for(uint32_t ed0)
 {
     uint32_t fa = ed0 & 0x7Fu;
     int d;
-    for (d = 0; d < s_plugged_pads; d++)
+    for (d = s_pad_unplugged ? 1 : 0; d < s_plugged_pads; d++)
         if (fa ? usb_gamepad_address(d) == fa : usb_gamepad_address(d) == 0)
             return d;
     return -1;
@@ -511,6 +515,7 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * again, forever. */
 static uint32_t bus_resolve(uint32_t addr)
 {
+    addr = xbox_PhysFoldHeapAlias(addr);
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
@@ -1031,6 +1036,66 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
     }
 }
 
+/* Hot-plug, for a single pad.
+ *
+ * The emulated pad is plugged in for good once the driver is listening, and
+ * on its own that hides an unplugged controller from the title: the game
+ * would carry on with nobody at the controls instead of showing its own
+ * "Controller disconnected" pause, which every Xbox title has. So when the
+ * host controller the player was using goes away, the pad is unplugged on
+ * its port the way a console sees a cable pulled: connect status cleared,
+ * the change flagged, the root hub interrupt raised. The driver drops the
+ * device and the title notices.
+ *
+ * It comes back -- a fresh device at address 0, enumerated again -- when a
+ * controller is plugged in, or when a key or mouse button is pressed, since
+ * the keyboard is a controller as far as the title is concerned. A player on
+ * the keyboard who never touched a pad is never unplugged.
+ *
+ * RECOMP_USB_HOTPLUG=0 turns it off. */
+static void ohci_hotplug(OhciController *hc, unsigned port)
+{
+    static int had_pad, off = -1;
+    static unsigned presses;
+    uint32_t *ps = &hc->reg[(HcRhPortStatus1 + port * 4) / 4];
+    int present;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_USB_HOTPLUG");
+        off = (e && *e == '0') || s_npads != 1;
+    }
+    if (off)
+        return;
+    present = xbox_InputPadPresent(0);
+    if (!s_pad_unplugged) {
+        if (present) {
+            had_pad = 1;
+            return;
+        }
+        if (!had_pad || !usb_gamepad_configured(0) || (mkb_enabled() && mkb_last_device_keyboard()))
+            return;
+        usb_gamepad_unplug(0);
+        g_ctrl_len_[0] = -1;
+        g_ctrl_sent_[0] = 0;
+        s_pad_unplugged = 1;
+        had_pad = 0;
+        presses = mkb_activity();
+        *ps &= ~(PORT_CCS | PORT_PES);
+        *ps |= PORT_CSC;
+        hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+        fprintf(stderr, "  [OHCI0] controller gone: pad unplugged from port %u\n", port + 1);
+        fflush(stderr);
+    } else if (present || (mkb_enabled() && mkb_activity() != presses)) {
+        s_pad_unplugged = 0;
+        had_pad = present;
+        *ps |= PORT_CCS | PORT_CSC;
+        hc->reg[HcInterruptStatus / 4] |= INTR_RHSC;
+        fprintf(stderr, "  [OHCI0] pad plugged back in on port %u (%s)\n", port + 1,
+                present ? "controller" : "keyboard");
+        fflush(stderr);
+    }
+}
+
 /* The controller, running on its own thread.
  *
  * It has to be its own thread for a reason that is easy to get wrong: the
@@ -1138,6 +1203,9 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                 settle = 0;
             }
         }
+
+        if (plugged)
+            ohci_hotplug(hc, first_port);
 
         /* The frame clock.
          *

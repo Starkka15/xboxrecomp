@@ -51,6 +51,37 @@ int mkb_enabled(void);
  */
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState);
 
+/*
+ * Bindings. Every control of the Xbox pad can be bound in mkb.ini to up
+ * to four keys or mouse buttons, by the names below ("A = Space, Enter").
+ * Unlisted controls keep the built-in layout; a listed one with nothing
+ * after the '=' is unbound. The mouse itself drives the camera stick.
+ */
+enum {
+    MKB_A, MKB_B, MKB_X, MKB_Y, MKB_BLACK, MKB_WHITE, MKB_LT, MKB_RT,
+    MKB_START, MKB_BACK, MKB_LS, MKB_RS,
+    MKB_DUP, MKB_DDOWN, MKB_DLEFT, MKB_DRIGHT,
+    MKB_MOVE_UP, MKB_MOVE_DOWN, MKB_MOVE_LEFT, MKB_MOVE_RIGHT,
+    MKB_CAM_UP, MKB_CAM_DOWN, MKB_CAM_LEFT, MKB_CAM_RIGHT,
+    MKB_NCONTROLS
+};
+
+/* The display name of the first input bound to a control ("Space",
+ * "Mouse1", "W"), or NULL when it has none. Loads the config if needed. */
+const char *mkb_binding_label(int control);
+
+/* Which device the player touched last, for on-screen button prompts:
+ * 1 = keyboard or mouse, 0 = a controller. Starts as the keyboard when no
+ * controller is plugged in. */
+int mkb_last_device_keyboard(void);
+
+/* Called by the controller backend when a real pad was used. */
+void mkb_note_pad_activity(void);
+
+/* Counts key and mouse-button presses, so a caller can tell whether the
+ * player pressed anything since it last looked. */
+unsigned mkb_activity(void);
+
 #ifdef __cplusplus
 }
 #endif

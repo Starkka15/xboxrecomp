@@ -117,6 +117,7 @@ static uint32_t dma_resolve(uint32_t offset)
 {
     extern uint32_t xbox_ContiguousAllocatedBytes(void);
 
+    offset = xbox_PhysFoldHeapAlias(offset);
     /* Did this runtime hand the offset out as contiguous memory? Then the
      * bytes live in the window, and that is not a guess: the arena is a bump
      * allocator from XBOX_CONTIG_BASE, so everything below its high-water
@@ -179,6 +180,7 @@ static int surface_write_refused(uint32_t base, uint32_t bytes, const char *what
 #define NV097_SET_SURFACE_CLIP_VERTICAL   0x0204
 #define NV097_SET_SURFACE_FORMAT          0x0208
 #define NV097_SET_SURFACE_PITCH           0x020C
+static int s_pb_dbg;               /* RECOMP_PB_DBG: [sub] and [coff] lines */
 #define NV097_SET_SURFACE_COLOR_OFFSET    0x0210
 #define NV097_SET_COLOR_CLEAR_VALUE       0x1D90
 #define NV097_CLEAR_SURFACE               0x1D94
@@ -827,9 +829,15 @@ static void current_render_state(Nv2aRenderState *r)
     r->stencil_fail      = s_reg[0x0370 / 4];        /* SET_STENCIL_OP_FAIL */
     r->stencil_zfail     = s_reg[0x0374 / 4];        /* SET_STENCIL_OP_ZFAIL */
     r->stencil_zpass     = s_reg[0x0378 / 4];        /* SET_STENCIL_OP_ZPASS */
+    r->clear_rect_h      = s_reg[0x1D98 / 4];        /* SET_CLEAR_RECT_HORIZONTAL */
+    r->clear_rect_v      = s_reg[0x1D9C / 4];        /* SET_CLEAR_RECT_VERTICAL */
+    r->depth_bits        = ((s_gpu.format >> 4) & 0xF) == 1 ? 16 : 24;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
+
+static uint32_t tex_texel_bytes(uint32_t fmt);
+static uint32_t tex_face_stride(const Texture *t);
 
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
 {
@@ -844,7 +852,7 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
     s_gpu.texs[0].color  = tex->color;
     s_gpu.texs[0].addr_u = 3;
     s_gpu.texs[0].addr_v = 3;
-    s_gpu.texs[0].palette = 0;          /* ponytail: no palettised formats */
+    s_gpu.texs[0].palette = tex->palette;
     s_gpu.texs[0].levels = 1;
     s_gpu.texs[0].filter = 0;
     s_gpu.texs[0].cube   = 0;
@@ -857,6 +865,24 @@ int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out)
             }
     s_gpu.texs[0] = saved;
     return ok;
+}
+
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex)
+{
+    uint32_t block = d3d8_format_dxt_block_bytes(tex->color);
+    if (block)
+        return ((tex->width + 3) / 4) * ((tex->height + 3) / 4) * block;
+    return tex->normalized ? tex->width * tex->height * tex_texel_bytes(tex->color)
+                           : tex->pitch * tex->height;
+}
+
+uint32_t nv2a_backend_face_stride(const Nv2aTexture *tex)
+{
+    Texture t;
+    memset(&t, 0, sizeof t);
+    t.width = tex->width; t.height = tex->height; t.pitch = tex->pitch;
+    t.color = tex->color; t.levels = tex->levels;
+    return tex_face_stride(&t);
 }
 
 /* Swizzled colour surfaces (SURFACE_FORMAT type 2, log2 width/height in bits
@@ -896,7 +922,8 @@ static void clear_surface(uint32_t param)
         Nv2aSurface surf;
         Nv2aRenderState rs;
 
-        if (!s_gpu.color_offset || !s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
+        /* Offset 0 is a real surface: the contiguous arena starts there. */
+        if (!s_gpu.pitch || !s_gpu.clip_h || bpp == 0)
             return;
         current_surface(&surf);
         current_render_state(&rs);
@@ -2007,6 +2034,8 @@ static Nv2aVertex *backend_slot(void)
     return &s_bverts[s_bcount];
 }
 
+static float fog_factor(float d);
+
 static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
 {
     float su = 1.0f, sv = 1.0f;
@@ -2022,7 +2051,12 @@ static void backend_from_xf(const Nv2aVshOutput *v, Nv2aVertex *o)
     o->diffuse = pack_color(v->d0);
     o->u = v->tex[0][0] * su;
     o->v = v->tex[0][1] * sv;
+    o->specular = pack_color(v->d1);
+    o->fog = fog_factor(v->fog[0]);
+    memcpy(o->tc, v->tex, sizeof o->tc);
 }
+
+static const Nv2aProgramDraw *s_bprog;     /* set while program_batch flushes */
 
 /* `textured`: the batch carried texture coordinates, so the bound texture is
  * part of it. */
@@ -2030,13 +2064,16 @@ static void backend_flush(int textured)
 {
     Nv2aSurface surf;
     Nv2aRenderState rs;
-    Nv2aTexture tex;
+    Nv2aTexture tex, stages[4];
     Nv2aBatch batch;
+    uint32_t fc = s_gpu.fog_color;
+    int st;
 
-    if (!s_bcount)
+    if (!s_bcount && !s_bprog)
         return;
     current_surface(&surf);
     current_render_state(&rs);
+    batch.program = s_bprog;
     batch.vertices = s_bverts;
     batch.count = s_bcount;
     batch.texture = NULL;
@@ -2051,10 +2088,33 @@ static void backend_flush(int textured)
         tex.addr_v = s_gpu.texs[0].addr_v;
         tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
         tex.filter = s_gpu.texs[0].filter;
+        tex.palette = s_gpu.texs[0].palette;
+        tex.cube = s_gpu.texs[0].cube;
+        tex.normalized = tex_size_from_format(tex.color);
         batch.texture = &tex;
     }
+    for (st = 0; st < 4; st++) {
+        const Texture *t = &s_gpu.texs[st];
+        Nv2aTexture *o = &stages[st];
+        batch.stage[st] = NULL;
+        if (!t->offset || !t->width || !t->height)
+            continue;
+        o->offset = t->offset; o->width = t->width; o->height = t->height;
+        o->pitch = t->pitch; o->color = t->color;
+        o->addr_u = t->addr_u; o->addr_v = t->addr_v;
+        o->levels = t->pitch ? 1 : t->levels; o->filter = t->filter;
+        o->palette = t->palette; o->cube = t->cube;
+        o->normalized = tex_size_from_format(t->color);
+        batch.stage[st] = o;
+    }
+    batch.rc = s_gpu.rc_seen ? &s_gpu.rc : NULL;
+    /* FOG_COLOR is R in bits 0-7, the reverse of a D3DCOLOR. */
+    batch.fog_color[0] = (float)(fc & 0xFF) / 255.0f;
+    batch.fog_color[1] = (float)((fc >> 8) & 0xFF) / 255.0f;
+    batch.fog_color[2] = (float)((fc >> 16) & 0xFF) / 255.0f;
+    batch.clip_plane_mode = s_gpu.clip_plane_mode;
     s_backend->draw(&surf, &batch);
-    s_gpu.tris_drawn += s_bcount / 3;
+    s_gpu.tris_drawn += s_bprog ? s_bprog->nindices / 3 : s_bcount / 3;
     s_bcount = 0;
     note_drawn();
 }
@@ -2097,6 +2157,16 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
             o[k].diffuse = vertex_color(ix[k]);
             o[k].u = textured ? uv[k][0] : 0.0f;
             o[k].v = textured ? uv[k][1] : 0.0f;
+            o[k].specular = 0;
+            o[k].fog = 1.0f;
+            memset(o[k].tc, 0, sizeof o[k].tc);
+            o[k].tc[0][3] = 1.0f;
+            o[k].tc[0][0] = o[k].u;
+            o[k].tc[0][1] = o[k].v;
+            if (tex_size_from_format(s_gpu.texs[0].color) && s_gpu.texs[0].width) {
+                o[k].tc[0][0] /= (float)s_gpu.texs[0].width;
+                o[k].tc[0][1] /= (float)s_gpu.texs[0].height;
+            }
         }
         s_bcount += 3;
         return;
@@ -2927,10 +2997,360 @@ static void xf_set_viewport(void)
     s_xf_o[2] = of[2];
 }
 
+/* One attribute of nverts vertices from index lo, as float4s every `step`
+ * floats of dst. fetch_attr's rules in a loop: a batch's elements share a type,
+ * and range-checking the two ends covers every one between. An inline batch's
+ * offsets are into inline_buf, not guest memory, so it goes through fetch_attr. */
+static void fetch_attr_run(const VertexAttr *a, uint32_t lo, uint32_t nverts, float *dst, uint32_t step)
+{
+    const uint8_t *mem = (const uint8_t *)xbox_GetMemoryOffset();
+    uint64_t at = (uint64_t)a->offset + (uint64_t)lo * a->stride;
+    uint64_t last = at + (uint64_t)(nverts - 1) * a->stride;
+    uint32_t i, k, n = a->size < 4 ? a->size : 4, stride = a->stride;
+    const uint8_t *p = mem + at;
+
+    if (s_gpu.inline_active || !a->offset || !guest_span_ok(at, attr_elem_bytes(a))
+        || !guest_span_ok(last, attr_elem_bytes(a))
+        || (a->type != 0 && a->type != 2 && a->type != 4)) {
+        for (i = 0; i < nverts; i++, dst += step)
+            fetch_attr(a, lo + i, dst);
+        return;
+    }
+    if (a->type == 2) {
+        for (i = 0; i < nverts; i++, dst += step, p += stride) {
+            dst[0] = dst[1] = dst[2] = 0.0f;
+            dst[3] = 1.0f;
+            for (k = 0; k < n; k++)
+                dst[k] = ((const float *)p)[k];
+        }
+    } else if (a->type == 0) {
+        for (i = 0; i < nverts; i++, dst += step, p += stride) {
+            dst[0] = (float)p[2] / 255.0f;
+            dst[1] = (float)p[1] / 255.0f;
+            dst[2] = (float)p[0] / 255.0f;
+            dst[3] = (float)p[3] / 255.0f;
+        }
+    } else {
+        for (i = 0; i < nverts; i++, dst += step, p += stride) {
+            dst[0] = dst[1] = dst[2] = 0.0f;
+            dst[3] = 1.0f;
+            for (k = 0; k < n; k++)
+                dst[k] = (float)p[k] / 255.0f;
+        }
+    }
+}
+
+/* DBG: constants of the same batch last time, kept so a spike can show what changed. */
+static struct { uint64_t h; uint32_t n, seq; float c[192][4]; } s_spk[16];
+static int s_spk_next, s_spk_dumps, s_spk_follow;
+
+static void spike_dump(uint64_t hash, uint32_t nverts, const char *tag, uint32_t vert, const float *v, uint32_t slots)
+{
+    const float (*c)[4] = (const float (*)[4])nv2a_vsh_constant(0);
+    char name[96];
+    FILE *f;
+    int q, r;
+    const Nv2aVshProgram *pr = nv2a_vsh_program();
+
+    sprintf(name, "H:/spyro-xbox/logs/dump/spk%d_%s.txt", s_spk_dumps, tag);
+    f = fopen(name, "w");
+    if (!f)
+        return;
+    fprintf(f, "prog %016llX nverts %u vertex %u\n", (unsigned long long)hash, nverts, vert);
+    for (r = 0; v && r < (int)slots; r++)
+        fprintf(f, "in%d %g %g %g %g\n", r, v[r * 4], v[r * 4 + 1], v[r * 4 + 2], v[r * 4 + 3]);
+    for (q = 0; q < 16; q++)
+        if (s_spk[q].h == hash && s_spk[q].n == nverts)
+            break;
+    for (r = 0; r < 192; r++) {
+        fprintf(f, "c%d %g %g %g %g", r, c[r][0], c[r][1], c[r][2], c[r][3]);
+        if (q < 16 && memcmp(c[r], s_spk[q].c[r], 16))
+            fprintf(f, " | was %g %g %g %g", s_spk[q].c[r][0], s_spk[q].c[r][1], s_spk[q].c[r][2], s_spk[q].c[r][3]);
+        fputc('\n', f);
+    }
+    for (r = 0; r < (int)pr->count; r++)
+        fprintf(f, "ins%d %08X %08X %08X %08X\n", r, pr->ins[r][0], pr->ins[r][1], pr->ins[r][2], pr->ins[r][3]);
+    fclose(f);
+}
+
+/* DBG: RECOMP_SPIKE runs a batch through the interpreter too and reports a triangle fv longer
+ * than the batch's others, then reads the guest's vertices again to see whether they moved. */
+static void spike_check(const float *verts, const uint32_t *tris, uint32_t m, uint32_t lo, uint32_t nverts,
+                        uint32_t inputs, uint32_t slots, const float imm[][4], uint64_t hash)
+{
+    static int on = -1, hits;
+    static uint32_t checked, moved;
+    static Nv2aVshOutput *o;
+    static float *again;
+    float in[NV2A_VSH_INPUTS][4];
+    double sum = 0;
+    uint32_t i, a, slot;
+    static struct { uint64_t h; uint32_t batches, maxv; float worst, worst_px; } st[32];
+    static int nst;
+    int si = 0;
+    float worst = 0, worst_px = 0;
+
+    if (on < 0) on = getenv("RECOMP_SPIKE") != NULL;
+    if (!on || hits >= 60 || nverts < 30 || nverts > 8000 || m < 30)
+        return;
+    if (!o) o = (Nv2aVshOutput *)malloc(8001 * sizeof *o);
+    if (!again) again = (float *)malloc(8001 * 16 * 4 * sizeof(float));
+    if (!(++checked % 30000)) {
+        int q;
+        fprintf(stderr, "[spike] %u batches checked, %u moved\n", checked, moved);
+        for (q = 0; q < nst; q++)
+            fprintf(stderr, "  prog %016llX batches %u max verts %u worst ratio %.1f (%.0f px)\n",
+                    (unsigned long long)st[q].h, st[q].batches, st[q].maxv, st[q].worst, st[q].worst_px);
+    }
+    for (si = 0; si < nst && st[si].h != hash; si++)
+        ;
+    if (si == nst && nst < 32) { st[si].h = hash; nst++; }
+    if (si < 32) { st[si].batches++; if (nverts > st[si].maxv) st[si].maxv = nverts; }
+    /* Moved under us? */
+    for (slot = 0, a = 0; a < NV2A_VSH_INPUTS; a++)
+        if (inputs >> a & 1) {
+            if (s_gpu.attr[a].size && s_gpu.attr[a].stride)
+                fetch_attr_run(&s_gpu.attr[a], lo, nverts, again + slot * 4, slots * 4);
+            else
+                for (i = 0; i < nverts; i++)
+                    memcpy(again + (i * slots + slot) * 4, imm[a], 16);
+            slot++;
+        }
+    if (memcmp(again, verts, (size_t)nverts * slots * 16)) {
+        for (i = 0; i < nverts * slots * 4 && again[i] == verts[i]; i++)
+            ;
+        if (moved++ < 20)
+            fprintf(stderr, "[spike] vertices moved during fetch: batch of %u, vertex %u slot %u: %g then %g\n",
+                    nverts, i / (slots * 4), i / 4 % slots, verts[i], again[i]);
+    }
+    for (i = 0; i < nverts; i++) {
+        const float *v = verts + i * slots * 4;
+        for (slot = 0, a = 0; a < NV2A_VSH_INPUTS; a++)
+            memcpy(in[a], (inputs >> a & 1) ? v + slot++ * 4 : imm[a], 16);
+        nv2a_vsh_run(in, &o[i]);
+    }
+#define EDGE(p, q) (fabsf(o[p].pos[0] - o[q].pos[0]) + fabsf(o[p].pos[1] - o[q].pos[1]))
+#define ONSCR(p) (o[p].pos[0] > -20 && o[p].pos[0] < 1300 && o[p].pos[1] > -20 && o[p].pos[1] < 980)
+    if (hash != 0x1A570199159C1CFAull && s_spk_dumps < 6 && !s_spk_follow) {
+        uint32_t neg = 0, at = 0;
+        float low = 0;
+        for (i = 0; i < nverts; i++)
+            if (o[i].pos[3] < 0) {
+                neg++;
+                if (o[i].pos[3] < low) { low = o[i].pos[3]; at = i; }
+            }
+        if (neg && neg * 8 < nverts && low < -1000) {
+            fprintf(stderr, "[spike] behind: prog %016llX batch %u verts, %u behind, vertex %u w %.1f\n",
+                    (unsigned long long)hash, nverts, neg, at, low);
+            spike_dump(hash, nverts, "hit", at, verts + at * slots * 4, slots);
+            s_spk_follow = 1;
+        }
+    }
+    for (i = 0; i + 2 < m; i += 3)
+        sum += EDGE(tris[i], tris[i + 1]);
+    sum /= m / 3;
+    for (i = 0; i + 2 < m; i += 3) {
+        uint32_t x = tris[i], y = tris[i + 1], z = tris[i + 2];
+        float e = EDGE(x, y), f = EDGE(y, z), g = EDGE(x, z);
+        float big = e > f ? e : f;
+        big = big > g ? big : g;
+        if (sum > 0.01 && big / sum > worst) { worst = big / (float)sum; worst_px = big; }
+        if (hash != 0x1A570199159C1CFAull && sum < 80 && big > 120 && big > sum * 8 && e > 0.01f && f > 0.01f && g > 0.01f && ONSCR(x) && ONSCR(y) && ONSCR(z)) {
+            uint32_t fv = (e < f && e < g) ? z : (f < g ? x : y);
+            uint32_t k;
+            const float *v = verts + fv * slots * 4;
+            fprintf(stderr, "[spike] prog %016llX batch %u verts tri %u/%u avg edge %.1f long %.1f: fv vertex %u (guest %u) at %.1f %.1f %.1f w %.5f; others %.1f %.1f, %.1f %.1f\n",
+                    (unsigned long long)hash, nverts, i / 3, m / 3, sum, big, fv, fv + lo,
+                    o[fv].pos[0], o[fv].pos[1], o[fv].pos[2], o[fv].pos[3],
+                    o[fv == x ? y : x].pos[0], o[fv == x ? y : x].pos[1],
+                    o[fv == z ? y : z].pos[0], o[fv == z ? y : z].pos[1]);
+            for (k = 0; k < slots; k++)
+                fprintf(stderr, "  in%u %g %g %g %g\n", k, v[k * 4], v[k * 4 + 1], v[k * 4 + 2], v[k * 4 + 3]);
+            if (s_spk_dumps < 6 && !s_spk_follow) {
+                spike_dump(hash, nverts, "hit", fv, v, slots);
+                s_spk_follow = 1;
+            }
+            if (++hits >= 60)
+                break;
+        }
+    }
+#undef EDGE
+#undef ONSCR
+    {
+        int q;
+        if (s_spk_follow == 2) {
+            for (q = 0; q < 16; q++)
+                if (s_spk[q].h == hash && s_spk[q].n == nverts)
+                    break;
+            if (q < 16 && s_spk[q].seq) {
+                spike_dump(hash, nverts, "after", 0, NULL, 0);
+                s_spk_dumps++;
+                s_spk_follow = 0;
+            }
+        } else if (s_spk_follow == 1) {
+            s_spk_follow = 2;
+        }
+        for (q = 0; q < 16; q++)
+            if (s_spk[q].h == hash && s_spk[q].n == nverts)
+                break;
+        if (q == 16) {
+            q = s_spk_next++ & 15;
+            s_spk[q].h = hash;
+            s_spk[q].n = nverts;
+            s_spk[q].seq = 0;
+        } else {
+            s_spk[q].seq++;
+        }
+        memcpy(s_spk[q].c, nv2a_vsh_constant(0), sizeof s_spk[q].c);
+    }
+    if (si < 32 && worst > st[si].worst) { st[si].worst = worst; st[si].worst_px = worst_px; }
+}
+
+/* Hand a program batch to a back end that runs vertex programs on the GPU.
+ * Returns 0 to leave it to the CPU path. */
+/* DBG: why a batch went to the CPU interpreter instead -- batches and vertices. */
+static const char *const s_cpu_why_name[] = { "fixed-function", "inline", "primitive", "invalid program",
+                                              "writes constants", "backend refused", "too many vertices", "no inputs" };
+static uint32_t s_cpu_why[8], s_cpu_why_verts[8];
+#define CPU_WHY(k) (s_cpu_why[k]++, s_cpu_why_verts[k] += s_gpu.idx_count, 0)
+
+static int program_batch(void)
+{
+    static float *verts;
+    static uint32_t *tris;
+    static size_t verts_cap;
+    static int off = -1;
+    static Nv2aProgramDraw p;
+    const Nv2aVshProgram *prog;
+    uint32_t n = s_gpu.idx_count, lo, hi, i, a, slot, m = 0, nverts, inputs;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_GPU_VSH");
+        off = e && e[0] == '0';
+    }
+    if (off || !s_backend || !s_backend->prepare_program || !batch_uses_program())
+        return CPU_WHY(0);
+    {
+        /* DBG: RECOMP_INLINE_CPU=1 sends inline batches back to the interpreter, for A/B checks. */
+        static int inline_cpu = -1;
+        if (inline_cpu < 0)
+            inline_cpu = getenv("RECOMP_INLINE_CPU") != NULL;
+        if (inline_cpu && s_gpu.inline_active)
+            return CPU_WHY(1);
+    }
+    if (s_gpu.prim < NV_PRIM_TRIANGLES || s_gpu.prim > NV_PRIM_POLYGON)
+        return CPU_WHY(2);
+    prog = nv2a_vsh_program();
+    if (!prog->valid)
+        return CPU_WHY(3);
+    if (prog->writes_constants)
+        return CPU_WHY(4);
+    if (!s_backend->prepare_program(prog->hash, prog->ins, prog->count, prog->inputs))
+        return CPU_WHY(5);
+    if (!tris && !(tris = (uint32_t *)malloc(NV_MAX_INDICES * 6 * sizeof *tris)))
+        return 0;
+
+    lo = hi = s_gpu.idx[0];
+    for (i = 1; i < n; i++) {
+        if (s_gpu.idx[i] < lo) lo = s_gpu.idx[i];
+        if (s_gpu.idx[i] > hi) hi = s_gpu.idx[i];
+    }
+    nverts = hi - lo + 1;
+    if (nverts > NV_MAX_INDICES * 2)
+        return CPU_WHY(6);
+
+    /* Every attribute the program reads has a slot: the shader's input
+     * signature is fixed, while whether one is an array varies by batch. */
+    inputs = prog->inputs;
+    for (a = 0; a < NV2A_VSH_INPUTS; a++) {
+        static const float dflt[4] = { 0, 0, 0, 1 };
+        if (!s_gpu.attr[a].size && a < NV_VERTEX_ATTRS)
+            memcpy(p.imm[a], s_gpu.imm_attr[a], sizeof p.imm[a]);
+        else
+            memcpy(p.imm[a], dflt, sizeof p.imm[a]);
+    }
+    if (!inputs)
+        return CPU_WHY(7);
+    for (slot = 0, a = inputs; a; a &= a - 1)
+        slot++;
+    if ((size_t)nverts * slot * 4 > verts_cap) {
+        free(verts);
+        verts_cap = (size_t)nverts * slot * 4 * 2;
+        if (!(verts = (float *)malloc(verts_cap * sizeof *verts))) {
+            verts_cap = 0;
+            return 0;
+        }
+    }
+    p.slots = slot;
+    for (slot = 0, a = 0; a < NV2A_VSH_INPUTS; a++)
+        if (inputs >> a & 1) {
+            float *dst = verts + slot++ * 4;
+            if (s_gpu.attr[a].size && s_gpu.attr[a].stride) {
+                fetch_attr_run(&s_gpu.attr[a], lo, nverts, dst, p.slots * 4);
+            } else {
+                for (i = 0; i < nverts; i++, dst += p.slots * 4)
+                    memcpy(dst, p.imm[a], sizeof p.imm[a]);
+            }
+        }
+
+#define TRI(x, y, z) (tris[m++] = s_gpu.idx[x] - lo, tris[m++] = s_gpu.idx[y] - lo, tris[m++] = s_gpu.idx[z] - lo)
+    switch (s_gpu.prim) {
+    case NV_PRIM_TRIANGLES:
+        for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_STRIP:
+        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2);
+        break;
+    case NV_PRIM_TRIANGLE_FAN:
+    case NV_PRIM_POLYGON:
+        for (i = 1; i + 1 < n; i++) TRI(0, i, i + 1);
+        break;
+    case NV_PRIM_QUADS:
+        for (i = 0; i + 3 < n; i += 4) { TRI(i, i + 1, i + 2); TRI(i, i + 2, i + 3); }
+        break;
+    case NV_PRIM_QUAD_STRIP:
+        for (i = 0; i + 3 < n; i += 2) { TRI(i, i + 1, i + 3); TRI(i, i + 3, i + 2); }
+        break;
+    default:
+        return 0;
+    }
+#undef TRI
+    spike_check(verts, tris, m, lo, nverts, inputs, p.slots, p.imm, prog->hash);
+    xf_set_viewport();
+    p.hash = prog->hash;
+    p.verts = verts;
+    p.nverts = nverts;
+    p.inputs = inputs;
+    p.indices = tris;
+    p.nindices = m;
+    p.constants = (const float (*)[4])nv2a_vsh_constant(0);
+    p.aa[0] = (float)s_gpu.aa_sx;
+    p.aa[1] = (float)s_gpu.aa_sy;
+    p.near_z = s_xf_o[2];
+    p.fog[0] = s_gpu.fog_param[0];
+    p.fog[1] = s_gpu.fog_param[1];
+    p.fog[2] = (s_gpu.fog_mode == 0x800 || s_gpu.fog_mode == 0x802) ? 1.0f
+             : (s_gpu.fog_mode == 0x801 || s_gpu.fog_mode == 0x803) ? 2.0f : 0.0f;
+    p.fog[3] = s_gpu.fog_enable ? 1.0f : 0.0f;
+    p.fog_abs = s_gpu.fog_mode == 0x802 || s_gpu.fog_mode == 0x803 || s_gpu.fog_mode == 0x804;
+    s_gpu.batches_program++;
+    s_gpu.verts_program += n;
+    if (s_gpu.texs[0].valid)
+        note_texture_use();
+    s_xf_no_tex = 0;
+    s_bcount = 0;
+    s_bprog = &p;
+    backend_flush(1);
+    s_bprog = NULL;
+    return 1;
+}
+
 static void raster_batch_program(void)
 {
     uint32_t i, n = s_gpu.idx_count;
 
+    if (program_batch())
+        return;
     if (!s_xf && !(s_xf = (Nv2aVshOutput *)calloc(NV_MAX_INDICES, sizeof *s_xf)))
         return;
     for (i = 0; i < n; i++)
@@ -3284,7 +3704,12 @@ static void draw_primitive(void)
         }
     }
 
-    if (getenv("RECOMP_PB_EXEC_VERBOSE")) {
+    /* Read once: getenv walks the whole environment, and this runs per draw
+     * (it was an eighth of the GPU thread in Spyro's levels). */
+    static int verbose = -1;
+    if (verbose < 0)
+        verbose = getenv("RECOMP_PB_EXEC_VERBOSE") != NULL;
+    if (verbose) {
         static int shown;
         if (shown++ < 6) {
             fprintf(stderr, "  [GPU] prim %u, %u indices, pos attr:"
@@ -3857,6 +4282,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         return;
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (s_pb_dbg && !(subch == 5 && method == 0x0310)) fprintf(stderr, "[sub] %u %04X %08X" "%c", subch, method, param, 10); /* DBG */
         note_unhandled(method, param);
         return;
     }
@@ -3887,6 +4313,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
     case NV097_SET_SURFACE_COLOR_OFFSET:
         if (s_ftrace == 2)
             fprintf(stderr, "[FTRACE] color offset -> %08X%c", param, 10);
+        if (s_pb_dbg && param != s_gpu.color_offset) fprintf(stderr, "[coff] %08X -> %08X\n", s_gpu.color_offset, param); /* DBG */
         s_gpu.color_offset = param;
         break;
     case NV097_SET_COLOR_CLEAR_VALUE:
@@ -4060,6 +4487,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                          : s_gpu.flip_write + 1;
         s_gpu.flips++;
         frame_trace_flip();
+        /* Every swap comes through here; FLIP_STALL only follows when the
+         * title waits for it, and a title in a hurry stops sending it. */
+        if (s_backend && s_backend->flip)
+            s_backend->flip();
         return;
 
     case NV097_FLIP_STALL: {
@@ -4130,8 +4561,6 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             }
         }
         s_gpu.drawn_stale = 1;
-        if (s_backend && s_backend->flip)
-            s_backend->flip();
 
         if (verbose) {
             static unsigned n;
@@ -4487,6 +4916,13 @@ void nv2a_pb_exec_report(void)
     fprintf(stderr, "[GPU] vertex programs: %u batches, %u vertices;"
                     " %u triangles dropped behind the eye\n",
             s_gpu.batches_program, s_gpu.verts_program, s_gpu.tris_behind);
+    {
+        int k;
+        for (k = 0; k < 8; k++)
+            if (s_cpu_why[k])
+                fprintf(stderr, "[GPU] CPU-transformed (%s): %u batches, %u vertices\n", s_cpu_why_name[k],
+                        s_cpu_why[k], s_cpu_why_verts[k]);
+    }
     if (s_gpu.batches_ffp)
         fprintf(stderr, "[GPU] fixed-function transform: %u batches\n",
                 s_gpu.batches_ffp);

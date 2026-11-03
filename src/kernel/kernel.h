@@ -1119,6 +1119,11 @@ extern PVOID            xbox_IdexChannelObject;
 
 /* EEPROM / Non-Volatile Settings */
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength);
+/* XC_VIDEO as the EEPROM holds it (RECOMP_VIDEO_FLAGS; kernel_xbox.c). */
+ULONG   xbox_VideoSetting(void);
+/* Blocks until the title has not written a file for quiet_ms (at most
+ * max_ms), so the process can end without cutting a save in half. */
+void    xbox_FileWritesSettle(DWORD quiet_ms, DWORD max_ms);
 NTSTATUS __stdcall xbox_ExSaveNonVolatileSetting(ULONG ValueIndex, ULONG Type, PVOID Value, ULONG ValueLength);
 
 /* ---- AV Pack types (returned by AvSendTVEncoderOption) ---- */

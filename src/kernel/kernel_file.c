@@ -53,6 +53,28 @@ static const char* get_xbox_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes)
 #define XBOX_BYTES_PER_SECTOR       512u
 #define XBOX_SECTORS_PER_CLUSTER    32u      /* 512 * 32 = 16384 */
 
+/* File times as FATX keeps them: whole seconds, even ones, like FAT.
+ *
+ * A title can tell its own save from one changed behind its back by keeping
+ * the save's last-write time and comparing it later. Spyro: A New Beginning
+ * reads the time back right after a save, stores it in the next save's
+ * header, and before an autosave requires the file's time to equal it. The
+ * host's 100 ns times move between the read-back and the final write by a few
+ * milliseconds that FATX never records, so every autosave failed with "The
+ * hard disk was removed. Autosaving has been disabled." */
+#define XBOX_FATX_TIME_STEP  20000000LL          /* 2 s in 100 ns units */
+static void fatx_time(LARGE_INTEGER *t)
+{
+    if (t->QuadPart > 0)
+        t->QuadPart -= t->QuadPart % XBOX_FATX_TIME_STEP;
+}
+static void fatx_times(LARGE_INTEGER *c, LARGE_INTEGER *a, LARGE_INTEGER *w)
+{
+    fatx_time(c);
+    fatx_time(a);
+    fatx_time(w);
+}
+
 /* ======================================================================== */
 /* Shared by both backends. kernel_bridge.c calls xbox_LastFileError()
  * unconditionally, so defining it only under _WIN32 leaves every POSIX link
@@ -254,6 +276,35 @@ NTSTATUS __stdcall xbox_NtCreateFile(
         return STATUS_OBJECT_PATH_NOT_FOUND;
     }
 
+    /* RECOMP_HIDE_FILES: game files that are "not there", by the end of
+     * their path, separated by ';' (Video\intro.xmv;Video\logo.xmv). A
+     * title that plays its logo movies when present skips them when absent,
+     * which is how a port offers "skip intros" without touching the title. */
+    {
+        static int init;
+        static WCHAR hide[1024];
+        const WCHAR *p;
+        if (!init) {
+            const char *e = getenv("RECOMP_HIDE_FILES");
+            if (e)
+                MultiByteToWideChar(CP_UTF8, 0, e, -1, hide, 1024);
+            init = 1;
+        }
+        for (p = hide; *p; ) {
+            const WCHAR *end = wcschr(p, L';');
+            size_t n = end ? (size_t)(end - p) : wcslen(p), len = wcslen(win_path);
+            if (n && n <= len && !_wcsnicmp(win_path + len - n, p, n)
+                && (n == len || win_path[len - n - 1] == L'\\')) {
+                if (IoStatusBlock) {
+                    IoStatusBlock->Status = STATUS_OBJECT_NAME_NOT_FOUND;
+                    IoStatusBlock->Information = 0;
+                }
+                return STATUS_OBJECT_NAME_NOT_FOUND;
+            }
+            p += n + (end ? 1 : 0);
+        }
+    }
+
     /* A partition device opened as a directory.
      *
      * The path layer maps \Device\Harddisk0\PartitionN to a PartitionN.img
@@ -398,6 +449,24 @@ NTSTATUS __stdcall xbox_NtReadFile(
     return STATUS_UNSUCCESSFUL;
 }
 
+/* When the title last wrote a file, for a clean quit: see
+ * xbox_FileWritesSettle. */
+static volatile DWORD s_last_write;
+
+/* Wait until the title has written nothing for quiet_ms, at most max_ms.
+ *
+ * Closing the window ends the process, and a save is a run of writes the
+ * title expects to finish: cutting one off in the middle leaves a save the
+ * game reports as damaged. The data of a write that did return is safe --
+ * it is in the host's cache and outlives the process -- so what matters is
+ * not stopping between two of them. */
+void xbox_FileWritesSettle(DWORD quiet_ms, DWORD max_ms)
+{
+    DWORD start = GetTickCount();
+    while (GetTickCount() - s_last_write < quiet_ms && GetTickCount() - start < max_ms)
+        Sleep(20);
+}
+
 NTSTATUS __stdcall xbox_NtWriteFile(
     HANDLE FileHandle, HANDLE Event, PIO_APC_ROUTINE ApcRoutine, PVOID ApcContext,
     PXBOX_IO_STATUS_BLOCK IoStatusBlock, PVOID Buffer, ULONG Length,
@@ -422,6 +491,7 @@ NTSTATUS __stdcall xbox_NtWriteFile(
     }
 
     if (result) {
+        s_last_write = GetTickCount();
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = bytes_written;
         if (Event) SetEvent(Event);
@@ -483,6 +553,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastAccessTime.HighPart = fi.ftLastAccessTime.dwHighDateTime;
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
+            fatx_times(&info->CreationTime, &info->LastAccessTime, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->FileAttributes = fi.dwFileAttributes;
             IoStatusBlock->Status = STATUS_SUCCESS;
@@ -526,6 +597,7 @@ NTSTATUS __stdcall xbox_NtQueryInformationFile(
             info->LastAccessTime.HighPart = fi.ftLastAccessTime.dwHighDateTime;
             info->LastWriteTime.LowPart   = fi.ftLastWriteTime.dwLowDateTime;
             info->LastWriteTime.HighPart  = fi.ftLastWriteTime.dwHighDateTime;
+            fatx_times(&info->CreationTime, &info->LastAccessTime, &info->LastWriteTime);
             info->ChangeTime = info->LastWriteTime;
             info->EndOfFile.QuadPart = ((LONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow;
             info->AllocationSize.QuadPart = (info->EndOfFile.QuadPart + 4095) & ~4095LL;
@@ -713,6 +785,8 @@ NTSTATUS __stdcall xbox_NtQueryFullAttributesFile(
     FileInformation->LastAccessTime.HighPart = fad.ftLastAccessTime.dwHighDateTime;
     FileInformation->LastWriteTime.LowPart   = fad.ftLastWriteTime.dwLowDateTime;
     FileInformation->LastWriteTime.HighPart  = fad.ftLastWriteTime.dwHighDateTime;
+    fatx_times(&FileInformation->CreationTime, &FileInformation->LastAccessTime,
+               &FileInformation->LastWriteTime);
     FileInformation->ChangeTime = FileInformation->LastWriteTime;
     FileInformation->EndOfFile.QuadPart = ((LONGLONG)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
     FileInformation->AllocationSize.QuadPart = (FileInformation->EndOfFile.QuadPart + 4095) & ~4095LL;
@@ -868,6 +942,7 @@ NTSTATUS __stdcall xbox_NtQueryDirectoryFile(
     entry->LastAccessTime.HighPart = ctx->find_data.ftLastAccessTime.dwHighDateTime;
     entry->LastWriteTime.LowPart  = ctx->find_data.ftLastWriteTime.dwLowDateTime;
     entry->LastWriteTime.HighPart = ctx->find_data.ftLastWriteTime.dwHighDateTime;
+    fatx_times(&entry->CreationTime, &entry->LastAccessTime, &entry->LastWriteTime);
     entry->ChangeTime = entry->LastWriteTime;
     entry->EndOfFile.QuadPart = ((LONGLONG)ctx->find_data.nFileSizeHigh << 32) | ctx->find_data.nFileSizeLow;
     entry->AllocationSize.QuadPart = (entry->EndOfFile.QuadPart + 4095) & ~4095LL;

@@ -4949,6 +4949,19 @@ static void bridge_NtQueryFullAttributesFile(void)
     if (!name.Buffer) { g_eax = STATUS_OBJECT_PATH_NOT_FOUND; return; }
     g_eax = (uint32_t)xbox_NtQueryFullAttributesFile(&oa,
                 (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va));
+    { /* DBG: RECOMP_FILE_TIMES prints what a title is told about a file's times. */
+        static int on = -1;
+        if (on < 0) on = getenv("RECOMP_FILE_TIMES") ? 1 : 0;
+        if (on) {
+            PXBOX_FILE_NETWORK_OPEN_INFORMATION fi =
+                (PXBOX_FILE_NETWORK_OPEN_INFORMATION)XBOX_TO_NATIVE(info_va);
+            fprintf(stderr, "  [FTIME] %s -> 0x%08X c=%08X%08X a=%08X%08X w=%08X%08X\n",
+                    name.Buffer, g_eax,
+                    (unsigned)fi->CreationTime.HighPart, (unsigned)fi->CreationTime.LowPart,
+                    (unsigned)fi->LastAccessTime.HighPart, (unsigned)fi->LastAccessTime.LowPart,
+                    (unsigned)fi->LastWriteTime.HighPart, (unsigned)fi->LastWriteTime.LowPart);
+        }
+    }
     /* Asking whether a file exists is not expecting it: a probe, listed only
      * under RECOMP_MISSING_FILES=all. */
     if (g_eax)
@@ -5547,6 +5560,12 @@ static void bridge_KeSetBasePriorityThread(void)
 /* ── KeStallExecutionProcessor (ordinal 151, 1 arg) */
 static void bridge_KeStallExecutionProcessor(void)
 {
+    { /* DBG */ static uint32_t ra[16]; static uint64_t us[16], cnt[16]; static DWORD t0;
+      uint32_t r = BRIDGE_MEM32(g_esp - 4), i, n = STACK_ARG(0); DWORD now = GetTickCount();
+      for (i = 0; i < 16 && ra[i] && ra[i] != r; i++) {}
+      if (i < 16) { ra[i] = r; us[i] += n; cnt[i]++; }
+      if (now - t0 > 5000) { t0 = now; for (i = 0; i < 16 && ra[i]; i++) { fprintf(stderr, "[stall] ret %08X x%llu %llu us\n", ra[i], cnt[i], us[i]); us[i] = cnt[i] = 0; } }
+    }
     xbox_KeStallExecutionProcessor(STACK_ARG(0));
     g_eax = 0;
 }

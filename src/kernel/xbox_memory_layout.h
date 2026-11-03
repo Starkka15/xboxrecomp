@@ -78,6 +78,19 @@ extern size_t g_xbox_total_ram;
 extern size_t g_xbox_map_size;
 void xbox_SetMapSize(size_t bytes);
 
+/* Opt-in: MmGetPhysicalAddress names a heap page below 64 MB as
+ * XBOX_HEAP_PHYS_ALIAS + VA instead of VA, on a layout that maps no RAM above
+ * 64 MB (see xbox_MmGetPhysicalAddress). Set before the title runs. */
+#define XBOX_HEAP_PHYS_ALIAS 0x04000000u
+extern int g_xbox_heap_phys_alias;
+static inline uint32_t xbox_PhysFoldHeapAlias(uint32_t pa)
+{
+    if (g_xbox_heap_phys_alias && pa >= XBOX_HEAP_PHYS_ALIAS &&
+            pa < 2u * XBOX_HEAP_PHYS_ALIAS)
+        return pa - XBOX_HEAP_PHYS_ALIAS;
+    return pa;
+}
+
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
  * See the implementation for why reservations must not come from the heap. */

@@ -28,6 +28,7 @@
 #define NV2A_BACKEND_H
 
 #include <stdint.h>
+#include "nv2a_combiner.h"
 
 /* The colour surface being drawn into, in real (anti-aliased) pixels.
  * aa_sx/aa_sy give the anti-aliasing factor, so width/aa_sx is the logical
@@ -51,6 +52,9 @@ typedef struct {
      * a linear texture) and the raw SET_TEXTURE_FILTER word (MIN in bits
      * 16-23). A back end that ignores them samples level 0. */
     uint32_t levels, filter;
+    uint32_t palette;           /* guest address of the CLUT, P8 only */
+    uint32_t cube;              /* six faces, not one */
+    uint32_t normalized;        /* coordinates are 0..1, not texels (swizzled, DXT) */
 } Nv2aTexture;
 
 typedef struct {
@@ -58,6 +62,9 @@ typedef struct {
     float    rhw;               /* 1/w, 1 for pre-transformed batches */
     uint32_t diffuse;           /* 0xAARRGGBB */
     float    u, v;              /* texels */
+    uint32_t specular;          /* 0xAARRGGBB, combiner register v1 */
+    float    fog;               /* factor from the fog unit, combiner fog.a */
+    float    tc[4][4];          /* each stage's coordinates as the title produced them */
 } Nv2aVertex;
 
 /* Render state as the title set it, in NV2A's own (OpenGL) enum values:
@@ -80,13 +87,40 @@ typedef struct {
      * that ignores these draws that pass over the whole surface. */
     uint32_t stencil_enable, stencil_func, stencil_ref, stencil_func_mask;
     uint32_t stencil_write_mask, stencil_fail, stencil_zfail, stencil_zpass;
+    /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: x0 | x1 << 16, y0 | y1 << 16, inclusive. */
+    uint32_t clear_rect_h, clear_rect_v;
+    uint32_t depth_bits;                                 /* 16 or 24 */
 } Nv2aRenderState;
+
+/* A batch whose vertex program the back end runs itself. verts holds nverts
+ * vertices of slots float4s each, one slot per set bit of inputs from the
+ * lowest up; attributes without a slot read imm[n]. indices is a triangle list.
+ * aa is the anti-aliasing scale; near_z the screen z of the near plane. */
+typedef struct {
+    uint64_t hash;
+    const float *verts;
+    uint32_t nverts, slots, inputs;
+    const uint32_t *indices;
+    uint32_t nindices;
+    const float (*constants)[4];    /* c[0..191] */
+    float imm[16][4];
+    float aa[2], near_z;
+    float fog[4];                   /* param 0, param 1, 0 linear 1 exp 2 exp2, enable */
+    uint32_t fog_abs;
+} Nv2aProgramDraw;
 
 typedef struct {
     const Nv2aVertex  *vertices;    /* triangle list: count is a multiple of 3 */
     uint32_t           count;
     const Nv2aTexture *texture;     /* NULL: untextured */
     const Nv2aRenderState *state;
+    /* Everything the combiners read. stage[i] is NULL for an unset stage; rc is
+     * NULL when the title has programmed no combiners. */
+    const Nv2aTexture *stage[4];
+    const Nv2aCombiner *rc;
+    float    fog_color[3];          /* r, g, b */
+    uint32_t clip_plane_mode;       /* SET_SHADER_CLIP_PLANE_MODE */
+    const Nv2aProgramDraw *program; /* set: vertices is unused */
 } Nv2aBatch;
 
 typedef struct {
@@ -96,6 +130,9 @@ typedef struct {
                   uint32_t flags, uint32_t argb, uint32_t zstencil);
     void (*draw)(const Nv2aSurface *s, const Nv2aBatch *b);
     void (*flip)(void);
+    /* Optional. Make ready to run this program on the GPU, returning 0 to keep
+     * it on the CPU path. A hash seen before answers at once. */
+    int (*prepare_program)(uint64_t hash, const uint32_t (*ins)[4], uint32_t count, uint32_t inputs);
 } Nv2aBackend;
 
 /* Register (or, with NULL, remove) the back end. Call before the title starts
@@ -106,6 +143,12 @@ void nv2a_backend_register(const Nv2aBackend *backend);
  * Handles every format the executor can sample (swizzled, linear, DXT).
  * Returns 0 if the format is not supported. */
 int nv2a_backend_decode_texture(const Nv2aTexture *tex, uint32_t *argb_out);
+
+/* Bytes the texture occupies in guest memory (level 0, one face), for content hashing. */
+uint32_t nv2a_backend_texture_bytes(const Nv2aTexture *tex);
+
+/* Bytes from one cube face to the next. */
+uint32_t nv2a_backend_face_stride(const Nv2aTexture *tex);
 
 /* Where BACK_END_WRITE_SEMAPHORE_RELEASE (0x1D70) values land: the guest VA
  * of the semaphore the title reads GPU progress from (for XDK D3D, the

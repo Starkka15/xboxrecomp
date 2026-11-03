@@ -104,6 +104,11 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration);
  */
 BOOL xbox_InputIsConnected(DWORD dwPort);
 
+/* Whether a host controller is plugged in for this port right now (not
+ * counting the keyboard). Asks the device, at most twice a second when
+ * there is none. */
+BOOL xbox_InputPadPresent(DWORD dwPort);
+
 /**
  * Get controller capabilities.
  */

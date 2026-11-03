@@ -32,9 +32,11 @@
 #include "mkb_input.h"
 
 #include <windows.h>
+#include <xinput.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <math.h>
 
 /* ---- configuration ----------------------------------------------------- */
@@ -49,6 +51,127 @@ typedef struct {
 } MkbConfig;
 
 static MkbConfig s_cfg = { 1.0, 0.18, 1.0, 8, 0, 0 };
+
+/* ---- bindings ---------------------------------------------------------- */
+
+/* An input is a virtual-key code (1-255), a mouse button (MOUSE_BTN + 1..5)
+ * or a wheel direction. Left and right Shift/Ctrl/Alt are told apart by the
+ * raw input handler, so VK_SHIFT and friends mean "either". */
+#define MOUSE_BTN   0x100
+#define WHEEL_UP    0x110
+#define WHEEL_DOWN  0x111
+#define MAX_BIND    4
+
+static const char *const CONTROL_NAMES[MKB_NCONTROLS] = {
+    "A", "B", "X", "Y", "Black", "White", "LeftTrigger", "RightTrigger",
+    "Start", "Back", "LeftStickClick", "RightStickClick",
+    "DpadUp", "DpadDown", "DpadLeft", "DpadRight",
+    "MoveForward", "MoveBack", "MoveLeft", "MoveRight",
+    "CameraUp", "CameraDown", "CameraLeft", "CameraRight",
+};
+
+static const struct { const char *name; int code; } INPUT_NAMES[] = {
+    { "Space", VK_SPACE }, { "Enter", VK_RETURN }, { "Esc", VK_ESCAPE }, { "Escape", VK_ESCAPE },
+    { "Tab", VK_TAB }, { "Backspace", VK_BACK }, { "CapsLock", VK_CAPITAL },
+    { "Shift", VK_SHIFT }, { "LShift", VK_LSHIFT }, { "RShift", VK_RSHIFT },
+    { "Ctrl", VK_CONTROL }, { "LCtrl", VK_LCONTROL }, { "RCtrl", VK_RCONTROL },
+    { "Alt", VK_MENU }, { "LAlt", VK_LMENU }, { "RAlt", VK_RMENU },
+    { "Up", VK_UP }, { "Down", VK_DOWN }, { "Left", VK_LEFT }, { "Right", VK_RIGHT },
+    { "Insert", VK_INSERT }, { "Delete", VK_DELETE }, { "Home", VK_HOME }, { "End", VK_END },
+    { "PageUp", VK_PRIOR }, { "PageDown", VK_NEXT },
+    { "Mouse1", MOUSE_BTN + 1 }, { "Mouse2", MOUSE_BTN + 2 }, { "Mouse3", MOUSE_BTN + 3 },
+    { "Mouse4", MOUSE_BTN + 4 }, { "Mouse5", MOUSE_BTN + 5 },
+    { "WheelUp", WHEEL_UP }, { "WheelDown", WHEEL_DOWN },
+};
+
+/* The built-in layout, kept from the first title this layer served: a
+ * shooter, mouse buttons on the triggers. A game ships its own in mkb.ini. */
+static int s_bind[MKB_NCONTROLS][MAX_BIND] = {
+    [MKB_A]          = { VK_SPACE },
+    [MKB_B]          = { 'E' },
+    [MKB_X]          = { 'R' },
+    [MKB_Y]          = { MOUSE_BTN + 3, WHEEL_UP, WHEEL_DOWN },
+    [MKB_BLACK]      = { 'F', MOUSE_BTN + 5 },
+    [MKB_WHITE]      = { 'Q', MOUSE_BTN + 4 },
+    [MKB_LT]         = { MOUSE_BTN + 2 },
+    [MKB_RT]         = { MOUSE_BTN + 1 },
+    [MKB_START]      = { VK_RETURN, VK_ESCAPE },
+    [MKB_BACK]       = { VK_TAB },
+    [MKB_LS]         = { VK_LSHIFT },
+    [MKB_RS]         = { VK_LCONTROL },
+    [MKB_DUP]        = { VK_UP },
+    [MKB_DDOWN]      = { VK_DOWN },
+    [MKB_DLEFT]      = { VK_LEFT },
+    [MKB_DRIGHT]     = { VK_RIGHT },
+    [MKB_MOVE_UP]    = { 'W' },
+    [MKB_MOVE_DOWN]  = { 'S' },
+    [MKB_MOVE_LEFT]  = { 'A' },
+    [MKB_MOVE_RIGHT] = { 'D' },
+};
+
+static int input_code(const char *name)
+{
+    size_t i;
+    if (!name[0])
+        return 0;
+    if (!name[1]) {
+        int c = toupper((unsigned char)name[0]);
+        if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
+            return c;
+    }
+    if ((name[0] == 'F' || name[0] == 'f') && atoi(name + 1) >= 1 && atoi(name + 1) <= 12)
+        return VK_F1 + atoi(name + 1) - 1;
+    if (!_strnicmp(name, "Num", 3) && name[3] >= '0' && name[3] <= '9' && !name[4])
+        return VK_NUMPAD0 + name[3] - '0';
+    for (i = 0; i < sizeof INPUT_NAMES / sizeof *INPUT_NAMES; i++)
+        if (!_stricmp(name, INPUT_NAMES[i].name))
+            return INPUT_NAMES[i].code;
+    return -1;
+}
+
+static const char *input_name(int code)
+{
+    static char buf[8];
+    size_t i;
+    if ((code >= 'A' && code <= 'Z') || (code >= '0' && code <= '9')) {
+        buf[0] = (char)code;
+        buf[1] = 0;
+        return buf;
+    }
+    if (code >= VK_F1 && code <= VK_F12) {
+        snprintf(buf, sizeof buf, "F%d", code - VK_F1 + 1);
+        return buf;
+    }
+    if (code >= VK_NUMPAD0 && code <= VK_NUMPAD9) {
+        snprintf(buf, sizeof buf, "Num%d", code - VK_NUMPAD0);
+        return buf;
+    }
+    for (i = 0; i < sizeof INPUT_NAMES / sizeof *INPUT_NAMES; i++)
+        if (INPUT_NAMES[i].code == code)
+            return INPUT_NAMES[i].name;
+    return NULL;
+}
+
+/* "A = Space, Enter": returns 1 when the key names a control. */
+static int mkb_apply_binding(const char *key, char *val)
+{
+    int c, n = 0;
+    char *tok, *ctx = NULL;
+
+    for (c = 0; c < MKB_NCONTROLS && _stricmp(key, CONTROL_NAMES[c]); c++)
+        ;
+    if (c == MKB_NCONTROLS)
+        return 0;
+    memset(s_bind[c], 0, sizeof s_bind[c]);
+    for (tok = strtok_s(val, ", \t", &ctx); tok && n < MAX_BIND; tok = strtok_s(NULL, ", \t", &ctx)) {
+        int code = input_code(tok);
+        if (code > 0)
+            s_bind[c][n++] = code;
+        else
+            fprintf(stderr, "  [MKB] mkb.ini: unknown input \"%s\" for %s\n", tok, key);
+    }
+    return 1;
+}
 
 /* One "key=value" line; returns 1 when the key was recognised. */
 static int mkb_apply_kv(const char *key, const char *val)
@@ -110,22 +233,44 @@ static void mkb_load_config(void)
     if (!f)
         return;
     {
-        char line[128];
+        char line[256];
         while (fgets(line, sizeof line, f)) {
             char *eq = strchr(line, '=');
-            char *k, *v;
-            if (!eq) continue;
+            char *k, *v, *semi;
+            if (!eq || line[strspn(line, " \t")] == ';' || line[strspn(line, " \t")] == '#')
+                continue;
             *eq = 0;
             k = line; v = eq + 1;
+            semi = strchr(v, ';');          /* trailing comment */
+            if (semi)
+                *semi = 0;
             while (*k == ' ' || *k == '\t') k++;
             while (*v == ' ' || *v == '\t') v++;
             k[strcspn(k, " \t\r\n")] = 0;
-            v[strcspn(v, " \t\r\n")] = 0;
-            if (*k && *v)
-                mkb_apply_kv(k, v);
+            v[strcspn(v, "\r\n")] = 0;
+            if (*k && !mkb_apply_binding(k, v)) {
+                v[strcspn(v, " \t")] = 0;
+                if (*v)
+                    mkb_apply_kv(k, v);
+            }
         }
     }
     fclose(f);
+}
+
+static void mkb_config_once(void)
+{
+    static LONG done;
+    if (InterlockedCompareExchange(&done, 1, 0) == 0)
+        mkb_load_config();
+}
+
+const char *mkb_binding_label(int control)
+{
+    if (control < 0 || control >= MKB_NCONTROLS)
+        return NULL;
+    mkb_config_once();
+    return s_bind[control][0] ? input_name(s_bind[control][0]) : NULL;
 }
 
 /* ---- raw input thread -------------------------------------------------- */
@@ -136,7 +281,48 @@ static void mkb_load_config(void)
 static volatile LONG s_dx, s_dy;
 static volatile LONG s_wheel;        /* wheel steps since last poll   */
 static volatile LONG s_mouse_btn;    /* 1 L, 2 R, 4 M, 8 X1, 16 X2    */
+static volatile LONG s_mouse_tap;    /* pressed since the last poll   */
 static volatile unsigned char s_vk_down[256];
+static volatile unsigned char s_vk_tap[256];   /* pressed since the last poll */
+
+/* -1 until known, then 1 keyboard/mouse, 0 controller. */
+static volatile LONG s_last_kb = -1;
+
+static int game_is_foreground(void);
+
+void mkb_note_pad_activity(void)
+{
+    if (s_last_kb != 0)
+        InterlockedExchange(&s_last_kb, 0);
+}
+
+static volatile LONG s_presses;
+
+unsigned mkb_activity(void)
+{
+    return (unsigned)s_presses;
+}
+
+static void note_kb_activity(void)
+{
+    if (s_last_kb != 1 && game_is_foreground())
+        InterlockedExchange(&s_last_kb, 1);
+}
+
+int mkb_last_device_keyboard(void)
+{
+    if (s_last_kb < 0) {
+        /* Nothing touched yet: a controller if one is plugged in. */
+        XINPUT_STATE st;
+        DWORD i;
+        LONG kb = 1;
+        for (i = 0; i < 4; i++)
+            if (XInputGetState(i, &st) == ERROR_SUCCESS)
+                kb = 0;
+        InterlockedCompareExchange(&s_last_kb, kb, -1);
+    }
+    return s_last_kb == 1;
+}
 
 static volatile LONG s_active = 1;   /* F9 toggles this               */
 static volatile LONG s_thread_up;
@@ -161,7 +347,22 @@ static void mkb_handle_raw(HRAWINPUT h)
         if (!(m->usFlags & MOUSE_MOVE_ABSOLUTE)) {
             if (m->lLastX) InterlockedAdd(&s_dx, m->lLastX);
             if (m->lLastY) InterlockedAdd(&s_dy, m->lLastY);
+            if (labs(m->lLastX) + labs(m->lLastY) > 6)   /* not a desk bump */
+                note_kb_activity();
         }
+        if (m->usButtonFlags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN |
+                                RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_4_DOWN |
+                                RI_MOUSE_BUTTON_5_DOWN | RI_MOUSE_WHEEL))
+            note_kb_activity();
+        if (m->usButtonFlags & (RI_MOUSE_LEFT_BUTTON_DOWN | RI_MOUSE_RIGHT_BUTTON_DOWN |
+                                RI_MOUSE_MIDDLE_BUTTON_DOWN | RI_MOUSE_BUTTON_4_DOWN |
+                                RI_MOUSE_BUTTON_5_DOWN) && game_is_foreground())
+            InterlockedIncrement(&s_presses);
+        if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)   InterlockedOr(&s_mouse_tap, 1);
+        if (m->usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN)  InterlockedOr(&s_mouse_tap, 2);
+        if (m->usButtonFlags & RI_MOUSE_MIDDLE_BUTTON_DOWN) InterlockedOr(&s_mouse_tap, 4);
+        if (m->usButtonFlags & RI_MOUSE_BUTTON_4_DOWN)      InterlockedOr(&s_mouse_tap, 8);
+        if (m->usButtonFlags & RI_MOUSE_BUTTON_5_DOWN)      InterlockedOr(&s_mouse_tap, 16);
         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_DOWN)
             InterlockedOr(&s_mouse_btn, 1);
         if (m->usButtonFlags & RI_MOUSE_LEFT_BUTTON_UP)
@@ -189,6 +390,21 @@ static void mkb_handle_raw(HRAWINPUT h)
     } else if (ri->header.dwType == RIM_TYPEKEYBOARD) {
         const RAWKEYBOARD *k = &ri->data.keyboard;
         UINT vk = k->VKey;
+
+        /* Raw input reports the generic modifier; bindings can name a side. */
+        if (vk == VK_SHIFT)
+            vk = MapVirtualKeyA(k->MakeCode, MAPVK_VSC_TO_VK_EX);
+        else if (vk == VK_CONTROL)
+            vk = (k->Flags & RI_KEY_E0) ? VK_RCONTROL : VK_LCONTROL;
+        else if (vk == VK_MENU)
+            vk = (k->Flags & RI_KEY_E0) ? VK_RMENU : VK_LMENU;
+        if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN) {
+            note_kb_activity();
+            if (!s_vk_down[vk & 0xFF] && game_is_foreground())
+                InterlockedIncrement(&s_presses);
+            if (vk && vk < 256)
+                s_vk_tap[vk] = 1;
+        }
 
         if (vk == MKB_TOGGLE_VK) {
             if (k->Message == WM_KEYDOWN && !s_vk_down[vk & 0xFF]) {
@@ -281,7 +497,7 @@ int mkb_enabled(void)
         const char *v = getenv("RECOMP_MKB");
         on = v && *v && *v != '0';
         if (on) {
-            mkb_load_config();
+            mkb_config_once();
             if (InterlockedCompareExchange(&s_thread_up, 0, 0) == 0) {
                 static LONG started = 0;
                 if (InterlockedCompareExchange(&started, 1, 0) == 0)
@@ -354,10 +570,44 @@ static void mkb_aim_vector(double ax, double ay, SHORT *out_x, SHORT *out_y)
     *out_y = (SHORT)(v > 32767 ? 32767 : v < -32768 ? -32768 : v);
 }
 
-#define MK_VK(k)  ((unsigned)(k) < 256 && s_vk_down[(k)])
+/* Held now, or pressed and released since the last poll (a tap shorter
+ * than a frame still reaches the title). VK_SHIFT, VK_CONTROL and VK_MENU
+ * mean either side. */
+static int vk_held(int vk)
+{
+    if (vk == VK_SHIFT)   return vk_held(VK_LSHIFT) || vk_held(VK_RSHIFT);
+    if (vk == VK_CONTROL) return vk_held(VK_LCONTROL) || vk_held(VK_RCONTROL);
+    if (vk == VK_MENU)    return vk_held(VK_LMENU) || vk_held(VK_RMENU);
+    return (unsigned)vk < 256 && (s_vk_down[vk] || s_vk_tap[vk]);
+}
+
+static int control_held(int c, LONG btn, LONG wheel)
+{
+    int i;
+    for (i = 0; i < MAX_BIND && s_bind[c][i]; i++) {
+        int code = s_bind[c][i];
+        if (code < 256 ? vk_held(code)
+            : code == WHEEL_UP ? wheel > 0
+            : code == WHEEL_DOWN ? wheel < 0
+            : (btn >> (code - MOUSE_BTN - 1)) & 1)
+            return 1;
+    }
+    return 0;
+}
 
 int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
+    static const struct { int control; WORD bit; } DIGITAL[] = {
+        { MKB_START, XBOX_GAMEPAD_START }, { MKB_BACK, XBOX_GAMEPAD_BACK },
+        { MKB_LS, XBOX_GAMEPAD_LEFT_THUMB }, { MKB_RS, XBOX_GAMEPAD_RIGHT_THUMB },
+        { MKB_DUP, XBOX_GAMEPAD_DPAD_UP }, { MKB_DDOWN, XBOX_GAMEPAD_DPAD_DOWN },
+        { MKB_DLEFT, XBOX_GAMEPAD_DPAD_LEFT }, { MKB_DRIGHT, XBOX_GAMEPAD_DPAD_RIGHT },
+    };
+    static const struct { int control; int index; } ANALOG[] = {
+        { MKB_A, XBOX_BUTTON_A }, { MKB_B, XBOX_BUTTON_B }, { MKB_X, XBOX_BUTTON_X },
+        { MKB_Y, XBOX_BUTTON_Y }, { MKB_BLACK, XBOX_BUTTON_BLACK }, { MKB_WHITE, XBOX_BUTTON_WHITE },
+        { MKB_LT, XBOX_BUTTON_LTRIGGER }, { MKB_RT, XBOX_BUTTON_RTRIGGER },
+    };
     SHORT aim_x = 0, aim_y = 0, mov_x = 0, mov_y = 0;
     WORD b = 0;
     BYTE analog[8];
@@ -388,23 +638,26 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     dx    = InterlockedExchange(&s_dx, 0);
     dy    = InterlockedExchange(&s_dy, 0);
     wheel = InterlockedExchange(&s_wheel, 0);
-    btn   = InterlockedExchange(&s_mouse_btn, 0);
+    btn   = s_mouse_btn | InterlockedExchange(&s_mouse_tap, 0);
 
     memset(analog, 0, sizeof analog);
 
-    /* ---- mouse buttons, as the Xbox pad sees them ---- */
-    if (btn & 0x01) analog[XBOX_BUTTON_RTRIGGER] = 255;  /* fire      */
-    if (btn & 0x02) analog[XBOX_BUTTON_LTRIGGER] = 255;  /* ADS/aim   */
-    if (btn & 0x04) b |= 0;                              /* M: below  */
+    for (i = 0; i < (int)(sizeof ANALOG / sizeof *ANALOG); i++)
+        if (control_held(ANALOG[i].control, btn, wheel))
+            analog[ANALOG[i].index] = 255;
+    for (i = 0; i < (int)(sizeof DIGITAL / sizeof *DIGITAL); i++)
+        if (control_held(DIGITAL[i].control, btn, wheel))
+            b |= DIGITAL[i].bit;
 
-    /* ---- keyboard: WASD movement ---- */
+    /* ---- keyboard: movement ---- */
     {
         int mx = 0, my = 0;
-        if (MK_VK('W')) my += 1;
-        if (MK_VK('S')) my -= 1;
-        if (MK_VK('A')) mx -= 1;
-        if (MK_VK('D')) mx += 1;
+        if (control_held(MKB_MOVE_UP, btn, wheel))    my += 1;
+        if (control_held(MKB_MOVE_DOWN, btn, wheel))  my -= 1;
+        if (control_held(MKB_MOVE_LEFT, btn, wheel))  mx -= 1;
+        if (control_held(MKB_MOVE_RIGHT, btn, wheel)) mx += 1;
         if (mx && my) { mx = (int)(mx * 70.71); my = (int)(my * 70.71); }
+        else          { mx *= 100; my *= 100; }
         if (mx || my) mkb_aim_vector(mx / 100.0, my / 100.0, &mov_x, &mov_y);
     }
 
@@ -414,28 +667,14 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
         double ay = -(double)dy / (double)s_cfg.full;
         if (s_cfg.invert_y) ay = -ay;
         mkb_aim_vector(ax, ay, &aim_x, &aim_y);
+    } else {
+        /* Keys on the camera stick, full throw, when the mouse is still. */
+        int cx = control_held(MKB_CAM_RIGHT, btn, wheel) - control_held(MKB_CAM_LEFT, btn, wheel);
+        int cy = control_held(MKB_CAM_UP, btn, wheel) - control_held(MKB_CAM_DOWN, btn, wheel);
+        aim_x = (SHORT)(cx * 32767);
+        aim_y = (SHORT)(cy * 32767);
     }
-
-    /* ---- keyboard: buttons (Black's layout) ---- */
-    if (MK_VK(VK_SPACE))  analog[XBOX_BUTTON_A]     = 255; /* use/jump */
-    if (MK_VK('R'))       analog[XBOX_BUTTON_X]     = 255; /* reload    */
-    if (MK_VK('E'))       analog[XBOX_BUTTON_B]     = 255; /* alt use   */
-    if (MK_VK('Q'))       analog[XBOX_BUTTON_WHITE] = 255; /* grenade   */
-    if (MK_VK('F'))       analog[XBOX_BUTTON_BLACK] = 255; /* alt gren. */
-    if (btn & 0x08)       analog[XBOX_BUTTON_WHITE] = 255; /* X1        */
-    if (btn & 0x10)       analog[XBOX_BUTTON_BLACK] = 255; /* X2        */
-    if (MK_VK(VK_RETURN) || MK_VK(VK_ESCAPE)) b |= XBOX_GAMEPAD_START;
-    if (MK_VK(VK_TAB))                         b |= XBOX_GAMEPAD_BACK;
-    if (MK_VK(VK_LSHIFT))                      b |= XBOX_GAMEPAD_LEFT_THUMB;
-    if (MK_VK(VK_LCONTROL))                    b |= XBOX_GAMEPAD_RIGHT_THUMB;
-    if (MK_VK(VK_UP))    b |= XBOX_GAMEPAD_DPAD_UP;
-    if (MK_VK(VK_DOWN))  b |= XBOX_GAMEPAD_DPAD_DOWN;
-    if (MK_VK(VK_LEFT))  b |= XBOX_GAMEPAD_DPAD_LEFT;
-    if (MK_VK(VK_RIGHT)) b |= XBOX_GAMEPAD_DPAD_RIGHT;
-
-    /* ---- wheel / middle button: cycle weapon ---- */
-    if (wheel || (btn & 0x04))
-        analog[XBOX_BUTTON_Y] = 255;
+    memset((void *)s_vk_tap, 0, sizeof s_vk_tap);
 
     /* ---- merge on top of whatever the host pad produced ---- */
     if (b)        { pState->Gamepad.wButtons |= b; any = 1; }

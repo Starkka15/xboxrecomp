@@ -50,6 +50,18 @@ void nv2a_vsh_set_cxt_write(uint32_t enable);         /* _CXT_WRITE_EN      */
  * transform this batch" rather than drawing garbage. */
 int  nv2a_vsh_run(const float in[NV2A_VSH_INPUTS][4], Nv2aVshOutput *out);
 
+/* The program the start slot selects, for a back end that runs it itself.
+ * Rescanned only after an upload. valid is 0 when no FINAL flag is reached. */
+typedef struct {
+    const uint32_t (*ins)[4];
+    uint32_t count;
+    uint32_t inputs;            /* bit n: some source reads v[n] */
+    uint64_t hash;
+    int valid;
+    int writes_constants;       /* an output goes to c[], which only the CPU can do */
+} Nv2aVshProgram;
+const Nv2aVshProgram *nv2a_vsh_program(void);
+
 /* Direct access, for the self-test. */
 void nv2a_vsh_set_constant(uint32_t index, const float v[4]);
 const float *nv2a_vsh_constant(uint32_t index);   /* for traces */

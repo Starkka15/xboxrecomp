@@ -10,6 +10,7 @@
  */
 
 #include "kernel.h"
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -199,6 +200,21 @@ static void tz_init(void)
 #endif
 }
 
+/* XC_VIDEO as the EEPROM holds it. XGetVideoFlags hands a title
+ * (value >> 16) & 0x5F, so the flags it knows (1 widescreen, 2 720p, 4 1080i,
+ * 8 480p, 0x10 letterbox, 0x40 PAL60) live in the high word. RECOMP_VIDEO_FLAGS
+ * sets them in those XGetVideoFlags terms; a title that honours widescreen then
+ * draws 16:9 squeezed into its 4:3 buffers, and its presenter has to show it
+ * at 16:9. Without it the low-word value below reads as no flags at all, which
+ * every title so far has been presented for. */
+ULONG xbox_VideoSetting(void)
+{
+    const char *e = getenv("RECOMP_VIDEO_FLAGS");
+    if (e && *e)
+        return (strtoul(e, NULL, 0) & 0x5Fu) << 16;
+    return XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -222,7 +238,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     case XC_VIDEO:
         /* NTSC with widescreen and HDTV support enabled */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            *(PULONG)Value = xbox_VideoSetting();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -313,7 +329,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
         { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
-        { ULONG v = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV; memcpy(blk + 0x34, &v, 4); }
+        { ULONG v = xbox_VideoSetting(); memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */
         if (Type) *Type = 3;

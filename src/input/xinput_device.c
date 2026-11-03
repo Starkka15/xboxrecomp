@@ -62,13 +62,69 @@ static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
 /* The keyboard on port 0 (RECOMP_KEYBOARD=1) comes from keyboard.c, shared
  * with the SDL backend; the GDI window in fb_present.c records the keys. */
 
+/* Hot-plug. Windows numbers controllers by the slot it gave them, which is
+ * not always 0 for the only pad (a pad that was plugged in second keeps
+ * slot 1 after the first is unplugged). The title's port n is the n-th
+ * connected slot instead, so whichever pad is plugged in is player 1.
+ *
+ * Asking XInput about an empty slot is slow -- it looks for the device
+ * again each time -- so an empty slot is asked twice a second, not on
+ * every poll. */
+static DWORD g_slot_checked[XBOX_MAX_CONTROLLERS];
+static BOOL  g_slot_present[XBOX_MAX_CONTROLLERS];
+
+static DWORD slot_state(DWORD slot, XINPUT_STATE *st)
+{
+    DWORD now = GetTickCount();
+    if (!g_slot_present[slot] && now - g_slot_checked[slot] < 500)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    g_slot_checked[slot] = now;
+    if (XInputGetState(slot, st) != ERROR_SUCCESS) {
+        g_slot_present[slot] = FALSE;
+        return ERROR_DEVICE_NOT_CONNECTED;
+    }
+    g_slot_present[slot] = TRUE;
+    return ERROR_SUCCESS;
+}
+
+static DWORD port_state(DWORD port, XINPUT_STATE *st)
+{
+    DWORD slot, n = 0;
+    for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
+        if (slot_state(slot, st) != ERROR_SUCCESS)
+            continue;
+        if (n++ == port)
+            return ERROR_SUCCESS;
+    }
+    return ERROR_DEVICE_NOT_CONNECTED;
+}
+
+/* For rumble: the slot behind a port, or -1. */
+static int port_slot(DWORD port)
+{
+    DWORD slot, n = 0;
+    for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++)
+        if (g_slot_present[slot] && n++ == port)
+            return (int)slot;
+    return -1;
+}
+
 void xbox_InputInit(void)
 {
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
         XINPUT_STATE state;
-        DWORD result = XInputGetState(i, &state);
-        g_controller_connected[i] = (result == ERROR_SUCCESS);
+        g_slot_checked[i] = GetTickCount() - 1000;
+        g_controller_connected[i] = slot_state(i, &state) == ERROR_SUCCESS;
     }
+}
+
+/* A pad that is being used, as opposed to one lying on the desk: any
+ * button, a trigger, or a stick well past its rest position. */
+static int pad_in_use(const XINPUT_GAMEPAD *g)
+{
+    return g->wButtons || g->bLeftTrigger > 40 || g->bRightTrigger > 40
+        || abs(g->sThumbLX) > 12000 || abs(g->sThumbLY) > 12000
+        || abs(g->sThumbRX) > 12000 || abs(g->sThumbRY) > 12000;
 }
 
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
@@ -79,7 +135,9 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetState(dwPort, &xi_state);
+    result = port_state(dwPort, &xi_state);
+    if (result == ERROR_SUCCESS && pad_in_use(&xi_state.Gamepad))
+        mkb_note_pad_activity();
     if (result != ERROR_SUCCESS) {
         g_controller_connected[dwPort] = FALSE;
         if (dwPort == 0) {
@@ -137,19 +195,29 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 {
     XINPUT_VIBRATION xi_vib;
+    int slot;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    slot = port_slot(dwPort);
+    if (slot < 0)
         return ERROR_DEVICE_NOT_CONNECTED;
 
     xi_vib.wLeftMotorSpeed = pVibration->wLeftMotorSpeed;
     xi_vib.wRightMotorSpeed = pVibration->wRightMotorSpeed;
-    return XInputSetState(dwPort, &xi_vib);
+    return XInputSetState((DWORD)slot, &xi_vib);
 }
 
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
     return g_controller_connected[dwPort];
+}
+
+BOOL xbox_InputPadPresent(DWORD dwPort)
+{
+    XINPUT_STATE st;
+    return dwPort < XBOX_MAX_CONTROLLERS && port_state(dwPort, &st) == ERROR_SUCCESS;
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)
@@ -160,7 +228,9 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    result = XInputGetCapabilities(dwPort, dwFlags, &xi_caps);
+    if (port_slot(dwPort) < 0)
+        return ERROR_DEVICE_NOT_CONNECTED;
+    result = XInputGetCapabilities((DWORD)port_slot(dwPort), dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 
     memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
@@ -309,6 +379,11 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     if (dwPort >= XBOX_MAX_CONTROLLERS) return FALSE;
     return g_controller_connected[dwPort];
+}
+
+BOOL xbox_InputPadPresent(DWORD dwPort)
+{
+    return dwPort < XBOX_MAX_CONTROLLERS && g_pads[dwPort] && SDL_GameControllerGetAttached(g_pads[dwPort]);
 }
 
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps)

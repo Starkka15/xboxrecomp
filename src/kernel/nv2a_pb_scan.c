@@ -466,6 +466,9 @@ int nv2a_pb_dma_walk(void)
 static int s_in_call;
 int nv2a_pb_scan_in_call(void) { return s_in_call; }
 
+static uint32_t s_seg_jump;                   /* where a top-level JUMP pointed */
+static uint32_t s_seg_cut;                    /* parameters a segment end cut off */
+
 static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                 uint32_t *jumps, uint32_t *unknown)
 {
@@ -481,8 +484,10 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
             uint32_t target = (w & 3u) == 1u ? (w & 0xFFFFFFFCu)
                                              : (w & 0x1FFFFFFCu);
             (*jumps)++;
-            if (!in_call)
+            if (!in_call) {
+                s_seg_jump = target & 0x0FFFFFFFu;
                 break;                        /* the ring: a jump ends it */
+            }
             va = 0x80000000u | (target & 0x0FFFFFFFu);
             end_va = va + 0x400000u;
             continue;
@@ -516,12 +521,44 @@ static uint32_t pb_walk_segment(uint32_t va, uint32_t end_va, int in_call,
                                         *(const uint32_t *)(mem + va));
                 va += 4;
                 words++;
+                if (i + 1 < count && va >= end_va)
+                    s_seg_cut += count - i - 1;
             }
             continue;
         }
         (*unknown)++;
     }
     return words;
+}
+
+/* The ring's wrap: everything from PUT's old place to the JUMP at the end of
+ * the ring, which is the only thing that knows where the ring ends and where
+ * it starts again. Returns the JUMP's target, 0 if none turned up in max_bytes. */
+uint32_t nv2a_pb_scan_to_jump(uint32_t start_va, uint32_t max_bytes)
+{
+    uint32_t words, jumps = 0, unknown = 0;
+    static uint32_t wraps, tail_words, cut_seen;
+
+    if (!pb_walk_enabled())
+        return 0;
+    if (s_exec_enabled) {
+        extern void nv2a_pb_exec_walk_begin(void);
+        nv2a_pb_exec_walk_begin();
+    }
+    s_seg_jump = 0;
+    words = pb_walk_segment(start_va, start_va + max_bytes, 0, &jumps, &unknown);
+    s_tot_words += words;
+    s_tot_unknown += unknown;
+    s_tot_jumps += jumps;
+    s_tot_segments++;
+    wraps++;
+    tail_words += words;
+    if (wraps <= 12 || !(wraps % 64) || s_seg_cut != cut_seen) { /* DBG */
+        fprintf(stderr, "[wrap] %u: %u words to the JUMP from %08X, target %08X, unknown %u, cut so far %u\n",
+                wraps, words, start_va, s_seg_jump, unknown, s_seg_cut);
+        cut_seen = s_seg_cut;
+    }
+    return s_seg_jump;
 }
 
 void nv2a_pb_scan_segment(uint32_t start_va, uint32_t end_va)

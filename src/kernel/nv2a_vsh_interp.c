@@ -53,25 +53,62 @@ static uint32_t field(const uint32_t *ins, int dw, int lo, int width)
     return (ins[dw] >> lo) & ((1u << width) - 1u);
 }
 
+static Nv2aVshProgram s_info;
+static int s_info_stale = 1;
+
+const Nv2aVshProgram *nv2a_vsh_program(void)
+{
+    uint32_t s;
+    uint64_t h = 14695981039346656037ull;
+
+    if (!s_info_stale)
+        return &s_info;
+    s_info_stale = 0;
+    memset(&s_info, 0, sizeof s_info);
+    if (s_start_slot >= NV2A_VSH_SLOTS)
+        return &s_info;
+    s_info.ins = (const uint32_t (*)[4])s_program[s_start_slot];
+    for (s = s_start_slot; s < NV2A_VSH_SLOTS; s++) {
+        const uint32_t *ins = s_program[s];
+        int i;
+
+        for (i = 0; i < 4; i++)
+            h = (h ^ ins[i]) * 1099511628211ull;
+        if (field(ins, 2, 26, 2) == 2 || field(ins, 2, 11, 2) == 2 || field(ins, 3, 28, 2) == 2)
+            s_info.inputs |= 1u << field(ins, 1, 9, 4);
+        if (field(ins, 3, 12, 4) && !field(ins, 3, 11, 1))
+            s_info.writes_constants = 1;
+        s_info.count++;
+        if (field(ins, 3, 0, 1)) {
+            s_info.valid = 1;
+            break;
+        }
+    }
+    s_info.hash = h;
+    return &s_info;
+}
+
 /* ---- uploads ------------------------------------------------------------ */
 
 void nv2a_vsh_set_load_slot(uint32_t slot)
 {
     s_load_slot = slot;
     s_load_word = 0;
+    s_info_stale = 1;
 }
 
 void nv2a_vsh_program_word(uint32_t word)
 {
     if (s_load_slot < NV2A_VSH_SLOTS)
         s_program[s_load_slot][s_load_word] = word;
+    s_info_stale = 1;
     if (++s_load_word == 4) {
         s_load_word = 0;
         s_load_slot++;
     }
 }
 
-void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; }
+void nv2a_vsh_set_start_slot(uint32_t slot) { s_start_slot = slot; s_info_stale = 1; }
 void nv2a_vsh_set_cxt_write(uint32_t enable) { s_cxt_write = enable; }
 
 void nv2a_vsh_set_constant_load(uint32_t index)
@@ -116,6 +153,7 @@ void nv2a_vsh_set_instruction(uint32_t slot, const uint32_t words[4])
 {
     if (slot < NV2A_VSH_SLOTS)
         memcpy(s_program[slot], words, sizeof s_program[slot]);
+    s_info_stale = 1;
 }
 
 /* ---- disassembly (RECOMP_VSH_DUMP) --------------------------------------- */

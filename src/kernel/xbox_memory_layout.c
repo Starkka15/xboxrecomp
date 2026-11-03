@@ -52,6 +52,7 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
+int g_xbox_heap_phys_alias = 0;
 
 void xbox_SetTotalRam(size_t bytes)
 {
@@ -956,12 +957,13 @@ static void poke_init(void)
                         " not a fix\n", g_poke_count);
 }
 
+static int peek_readable(uint32_t va);  /* defined below */
 static void poke_tick(void)
 {
     int i;
 
     for (i = 0; i < g_poke_count; i++) {
-        if (!fence_readable(g_poke[i].va, 4))
+        if (!peek_readable(g_poke[i].va))
             continue;
         {
             volatile uint32_t *w = (volatile uint32_t *)
@@ -1226,6 +1228,14 @@ void xbox_Nv2aFrameCounterFlip(void)
 {
     int i;
 
+    /* RECOMP_VBLANK_WALLCLOCK: the count stays on the 60 Hz tick, for titles that time video by it. */
+    {
+        static int wallclock = -1;
+        if (wallclock < 0)
+            wallclock = getenv("RECOMP_VBLANK_WALLCLOCK") != NULL;
+        if (wallclock)
+            return;
+    }
     g_frame_counter_flip_ms = GetTickCount();
     if (!g_frame_counter_flip_ms)
         g_frame_counter_flip_ms = 1;          /* 0 means "never" */
@@ -1240,6 +1250,30 @@ static void frame_counters_tick(void)
 
     if (!g_frame_counter_count)
         return;
+    /* RECOMP_VBLANK_WALLCLOCK: the count a title times video by has to keep real time. One bump per
+     * GetTickCount period loses ticks to its 16 ms granularity and to any time this thread is held,
+     * which read as 37 Hz. Bump up to the number of 59.94 Hz fields since the first tick instead. */
+    {
+        static int wallclock = -1;
+        static LARGE_INTEGER freq, start;
+        static uint64_t done;
+        LARGE_INTEGER q;
+        uint64_t target;
+
+        if (wallclock < 0) {
+            wallclock = getenv("RECOMP_VBLANK_WALLCLOCK") != NULL;
+            QueryPerformanceFrequency(&freq);
+            QueryPerformanceCounter(&start);
+        }
+        if (wallclock) {
+            QueryPerformanceCounter(&q);
+            target = (uint64_t)(q.QuadPart - start.QuadPart) * 60000u / ((uint64_t)freq.QuadPart * 1001u);
+            for (; done < target; done++)
+                for (i = 0; i < g_frame_counter_count; i++)
+                    frame_counter_bump(i);
+            return;
+        }
+    }
     if (g_frame_counter_last_ms
             && (now - g_frame_counter_last_ms) < XBOX_FRAME_PERIOD_MS)
         return;
@@ -1452,7 +1486,9 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
          * its segment and the two are the same; a segment carrying two
          * flips paces only the last. */
         extern int nv2a_pb_exec_flip_poll(void);
+        extern void dbg_pass(void);
         int flip_held = nv2a_pb_exec_flip_poll();
+        dbg_pass(); /* DBG */
         nv2a_ack_busy_bits(flip_held);
         for (size_t i = 0; i < sizeof(NV2A_IDLE) / sizeof(NV2A_IDLE[0]); i++) {
             volatile uint32_t *r =
@@ -1554,14 +1590,17 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
                             nv2a_pb_scan_segment(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
                                                  XBOX_CONTIG_BASE | (put      & 0x0FFFFFFFu));
                         } else if (last_put && put < last_put) {
-                            if (put_hi > last_put)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put_hi   & 0x0FFFFFFFu));
-                            if (put > put_lo)
-                                nv2a_pb_scan_segment(
-                                    XBOX_CONTIG_BASE | (put_lo & 0x0FFFFFFFu),
-                                    XBOX_CONTIG_BASE | (put    & 0x0FFFFFFFu));
+                            /* The highest and lowest PUT are only where the title
+                             * happened to kick: what lies past them belongs to the
+                             * frame too. The JUMP at the ring's end knows. */
+                            extern uint32_t nv2a_pb_scan_to_jump(uint32_t, uint32_t);
+                            uint32_t head = nv2a_pb_scan_to_jump(XBOX_CONTIG_BASE | (last_put & 0x0FFFFFFFu),
+                                                                 0x100000u);
+                            if (!head)
+                                head = put_lo & 0x0FFFFFFFu;
+                            if ((put & 0x0FFFFFFFu) > head)
+                                nv2a_pb_scan_segment(XBOX_CONTIG_BASE | head,
+                                                     XBOX_CONTIG_BASE | (put & 0x0FFFFFFFu));
                         }
                     }
                     /* Periodic, because what the title submits at init is not
@@ -4194,6 +4233,21 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             /* Skip the run that stopped us, then realign. */
             while (q < limit && !contig_page_free(q, avoid)) q++;
             p = (q + align_pages - 1) & ~(align_pages - 1);
+        }
+    }
+    /* Too big to fit above the low reserve: place it as high as it fits, as the
+     * console kernel does, so it takes as little of the low memory as possible. */
+    if (!result && limit > CONTIG_LOW_RESERVE_END && n <= limit - lo_page) {
+        for (p = (limit - n) & ~(align_pages - 1); p >= lo_page; p -= align_pages) {
+            for (q = p; q < p + n && !g_contig_used[q]; q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                break;
+            }
+            if (p < align_pages)
+                break;
         }
     }
     if (result) {

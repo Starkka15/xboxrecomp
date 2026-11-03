@@ -185,6 +185,16 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
         return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
     /* The same number can be a window page; record that the title meant RAM
      * (xbox_PhysNoteRamName says why the APU needs to know). */
+    /* The record is per page, and both pages can be live and named at once:
+     * Spyro's menu-click effects sit in the window while the menu video's
+     * file buffer, a heap page with the same number, feeds the video's sound.
+     * The APU read the effect from the file buffer, PCM decoded as ADPCM --
+     * static on every move between options. With nothing mapped above 64 MB a
+     * second number for the heap page is free, and every bus master folds it
+     * back (xbox_PhysFoldHeapAlias; the APU's wrap). */
+    if (g_xbox_heap_phys_alias && XBOX_HEAP_TOP <= XBOX_HEAP_PHYS_ALIAS &&
+            va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP)
+        return (ULONG_PTR)(va + XBOX_HEAP_PHYS_ALIAS);
     xbox_PhysNoteRamName(va);
     return (ULONG_PTR)va;
 }
