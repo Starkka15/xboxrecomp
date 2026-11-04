@@ -45,7 +45,7 @@ typedef struct {
     double sens;        /* multiplier on the aim deflection          */
     double dz;          /* assumed game deadzone, 0..1               */
     double acc;         /* aim acceleration exponent, 1 = linear     */
-    long   full;        /* mouse counts for full throw, per poll     */
+    long   full;        /* mouse counts for full throw, per 16 ms    */
     int    invert_y;    /* invert the vertical aim axis              */
     int    swap_sticks; /* mouse aims with the left stick instead    */
 } MkbConfig;
@@ -537,15 +537,27 @@ static void mkb_manage_cursor(int capture)
     last = now;
 
     if (capture) {
+        /* The client area only: with the whole window rectangle the
+         * pointer still reached the title bar. ShowCursor below counts
+         * per thread and this runs on the game's poll thread, so it does
+         * not hide anything over a window another thread owns; the window
+         * procedure hides the pointer itself while mkb_captured() is true. */
         RECT r;
         HWND fg = GetForegroundWindow();
-        if (fg && GetWindowRect(fg, &r))
+        if (fg && GetClientRect(fg, &r)) {
+            MapWindowPoints(fg, NULL, (POINT *)&r, 2);
             ClipCursor(&r);
+        }
         if (hidden < 5) { ShowCursor(FALSE); hidden++; }
     } else {
         if (hidden > 0) { ShowCursor(TRUE); hidden--; }
         ClipCursor(NULL);
     }
+}
+
+int mkb_captured(void)
+{
+    return mkb_enabled() && s_thread_up && s_active && game_is_foreground();
 }
 
 /* Radial deadzone compensation: an input radius in [0..1] comes out as
@@ -635,8 +647,26 @@ int mkb_merge(DWORD dwPort, XBOX_INPUT_STATE *pState)
     }
     mkb_manage_cursor(1);
 
-    dx    = InterlockedExchange(&s_dx, 0);
-    dy    = InterlockedExchange(&s_dy, 0);
+    /* Mouse travel is taken once per ~16 ms window and the same deflection
+     * is returned to every poll inside it. Taking it per poll gave it all
+     * to whichever read came first: a title that reads its pad more than
+     * once a frame (Spyro does) used a later, centred read, and the mouse
+     * did nothing. */
+    {
+        static LARGE_INTEGER win_start, freq;
+        static LONG win_dx, win_dy;
+        LARGE_INTEGER now;
+        if (!freq.QuadPart)
+            QueryPerformanceFrequency(&freq);
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - win_start.QuadPart) * 1000 >= 16 * freq.QuadPart) {
+            win_dx = InterlockedExchange(&s_dx, 0);
+            win_dy = InterlockedExchange(&s_dy, 0);
+            win_start = now;
+        }
+        dx = win_dx;
+        dy = win_dy;
+    }
     wheel = InterlockedExchange(&s_wheel, 0);
     btn   = s_mouse_btn | InterlockedExchange(&s_mouse_tap, 0);
 

@@ -14,7 +14,7 @@
  *   RECOMP_MKB=0|1        master switch            (default off, opt-in)
  *   RECOMP_MKB_SENS=f     mouse sensitivity        (default 1.0)
  *   RECOMP_MKB_FULL=n     mouse counts for a full  (default 8)
- *                         stick throw, per poll
+ *                         stick throw, per 16 ms
  *   RECOMP_MKB_DZ=f       assumed game deadzone    (default 0.18)
  *   RECOMP_MKB_ACC=f      aim acceleration         (default 1.0 = off)
  *   RECOMP_MKB_INVERT_Y=1 invert vertical aim      (default off)
@@ -74,6 +74,11 @@ const char *mkb_binding_label(int control);
  * 1 = keyboard or mouse, 0 = a controller. Starts as the keyboard when no
  * controller is plugged in. */
 int mkb_last_device_keyboard(void);
+
+/* True while the mouse is captured for the game (layer on, not released
+ * with F9, game in the foreground). A window procedure hides the pointer
+ * on WM_SETCURSOR while this holds. */
+int mkb_captured(void);
 
 /* Called by the controller backend when a real pad was used. */
 void mkb_note_pad_activity(void);
