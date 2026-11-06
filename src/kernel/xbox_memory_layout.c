@@ -4429,6 +4429,19 @@ void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    /* Image pages too, when the title names one through its image address.
+     * Spyro: A Hero's Tail mixes in software into five 4096-sample rings that
+     * are static arrays in its BSS (physical 0x490000-0x49A000) and hands their
+     * MmGetPhysicalAddress to DirectSound; its own memory pool holds window
+     * pages with the same numbers, filled with 0x51. Read as the window, the
+     * five speaker voices played 0x5151 -- a constant that pinned the output at
+     * full scale, so nothing was heard but a click at start and exit.
+     * The image is never freed, so this record never needs to clear. A
+     * DirectSound voice array in the window is named through its window
+     * address (0x80000000 + P), which returns before this call, so the case
+     * mcpx_apu_phys orders the window first for is untouched. */
+    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
+        g_phys_ram_named[va / CONTIG_PAGE] = 1;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name

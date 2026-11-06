@@ -55,6 +55,11 @@ typedef struct {
     uint32_t palette;           /* guest address of the CLUT, P8 only */
     uint32_t cube;              /* six faces, not one */
     uint32_t normalized;        /* coordinates are 0..1, not texels (swizzled, DXT) */
+    /* BORDER (address mode 4): with border_color set, texels outside the image
+     * read border (SET_TEXTURE_BORDER_COLOR, 0xAARRGGBB). Projected shadow maps
+     * rely on it: a back end that samples black there darkens everything
+     * outside the projection. Clear: the border comes from the image (clamp). */
+    uint32_t border_color, border;
 } Nv2aTexture;
 
 typedef struct {
@@ -90,6 +95,13 @@ typedef struct {
     /* SET_CLEAR_RECT_HORIZONTAL/VERTICAL: x0 | x1 << 16, y0 | y1 << 16, inclusive. */
     uint32_t clear_rect_h, clear_rect_v;
     uint32_t depth_bits;                                 /* 16 or 24 */
+    /* SET_POLY_OFFSET_FILL_ENABLE (0x0338) and SET_POLYGON_OFFSET_SCALE_FACTOR/
+     * BIAS (0x0384/0x0388), GL glPolygonOffset: factor * dz + units * r. Coplanar
+     * decals (a page on a clipboard, eyes on a face) rely on it; without it they
+     * z-fight with the surface under them whenever the camera moves. */
+    uint32_t poly_offset_fill;
+    float    poly_offset_factor, poly_offset_units;
+    uint32_t control0;          /* SET_CONTROL0 (0x0290): Z_FORMAT float, Z_PERSPECTIVE (w-buffer) */
 } Nv2aRenderState;
 
 /* A batch whose vertex program the back end runs itself. verts holds nverts

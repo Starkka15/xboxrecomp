@@ -832,6 +832,10 @@ static void current_render_state(Nv2aRenderState *r)
     r->clear_rect_h      = s_reg[0x1D98 / 4];        /* SET_CLEAR_RECT_HORIZONTAL */
     r->clear_rect_v      = s_reg[0x1D9C / 4];        /* SET_CLEAR_RECT_VERTICAL */
     r->depth_bits        = ((s_gpu.format >> 4) & 0xF) == 1 ? 16 : 24;
+    r->poly_offset_fill  = s_reg[0x0338 / 4];        /* SET_POLY_OFFSET_FILL_ENABLE */
+    r->poly_offset_factor = reg_f(0x0384);           /* SET_POLYGON_OFFSET_SCALE_FACTOR */
+    r->poly_offset_units = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
+    r->control0          = s_reg[0x0290 / 4];        /* SET_CONTROL0 */
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
@@ -2086,11 +2090,17 @@ static void backend_flush(int textured)
         tex.color  = s_gpu.texs[0].color;
         tex.addr_u = s_gpu.texs[0].addr_u;
         tex.addr_v = s_gpu.texs[0].addr_v;
-        tex.levels = s_gpu.texs[0].pitch ? 1 : s_gpu.texs[0].levels;
+        /* Linear (rect) textures have one level. Decided by format, not by pitch: CONTROL1's pitch stays
+         * set after a linear texture, and every swizzled/DXT texture bound to that stage afterwards lost
+         * its mip chain -- Spyro AHT's whole world then sampled level 0 only and shimmered as the camera
+         * moved. */
+        tex.levels = tex_size_from_format(s_gpu.texs[0].color) ? s_gpu.texs[0].levels : 1;
         tex.filter = s_gpu.texs[0].filter;
         tex.palette = s_gpu.texs[0].palette;
         tex.cube = s_gpu.texs[0].cube;
         tex.normalized = tex_size_from_format(tex.color);
+        tex.border_color = s_gpu.texs[0].border_color;
+        tex.border = s_gpu.texs[0].border;
         batch.texture = &tex;
     }
     for (st = 0; st < 4; st++) {
@@ -2102,9 +2112,10 @@ static void backend_flush(int textured)
         o->offset = t->offset; o->width = t->width; o->height = t->height;
         o->pitch = t->pitch; o->color = t->color;
         o->addr_u = t->addr_u; o->addr_v = t->addr_v;
-        o->levels = t->pitch ? 1 : t->levels; o->filter = t->filter;
+        o->levels = tex_size_from_format(t->color) ? t->levels : 1; o->filter = t->filter;   /* see above */
         o->palette = t->palette; o->cube = t->cube;
         o->normalized = tex_size_from_format(t->color);
+        o->border_color = t->border_color; o->border = t->border;
         batch.stage[st] = o;
     }
     batch.rc = s_gpu.rc_seen ? &s_gpu.rc : NULL;
