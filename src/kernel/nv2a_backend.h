@@ -39,6 +39,11 @@ typedef struct {
     uint32_t pitch;             /* bytes per row */
     uint32_t bytes_per_pixel;   /* 2 or 4 */
     uint32_t aa_sx, aa_sy;      /* 1 or 2 each */
+    /* SET_SURFACE_FORMAT word; the colour code is bits 0-3. X8R8G8B8_Z8R8G8B8 (4) and
+     * X1R5G5B5_Z1R5G5B5 (1) store zero in the X bits whatever the pixel's
+     * alpha; the _O variants (5, 2) store one. Titles read those bits back as
+     * alpha when they sample the surface. */
+    uint32_t color_format;
 } Nv2aSurface;
 
 /* A texture as the title programmed it. uv in Nv2aVertex are in texels. */
@@ -60,6 +65,11 @@ typedef struct {
      * rely on it: a back end that samples black there darkens everything
      * outside the projection. Clear: the border comes from the image (clamp). */
     uint32_t border_color, border;
+    /* SET_TEXTURE_CONTROL0 ALPHA_KILL_ENABLE: a pixel whose texel from this
+     * stage has alpha 0 is not drawn at all (xemu: "if (tN.a == 0.0) discard").
+     * Spyro ANB builds its shadow mask that way: a full-screen copy of the
+     * frame keeps only the pixels its shadow volumes marked in alpha. */
+    uint32_t alpha_kill;
 } Nv2aTexture;
 
 typedef struct {
