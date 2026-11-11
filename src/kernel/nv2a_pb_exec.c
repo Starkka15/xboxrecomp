@@ -269,6 +269,7 @@ typedef struct {
     uint32_t levels;                    /* mip levels, from FORMAT       */
     uint32_t filter;                    /* SET_TEXTURE_FILTER            */
     uint32_t border;                    /* SET_TEXTURE_BORDER_COLOR      */
+    uint32_t control0;                  /* SET_TEXTURE_CONTROL0          */
     int      border_color;              /* FORMAT: BORDER reads `border` */
     int      cube;                      /* FORMAT: six faces, not one    */
     int      valid;
@@ -796,6 +797,7 @@ static void current_surface(Nv2aSurface *out)
     out->bytes_per_pixel = surface_bpp();
     out->aa_sx           = s_gpu.aa_sx > 1.5f ? 2 : 1;
     out->aa_sy           = s_gpu.aa_sy > 1.5f ? 2 : 1;
+    out->color_format    = s_gpu.format;
 }
 
 /* Render state in the NV2A's own values, gathered from what the executor
@@ -2091,6 +2093,7 @@ static void backend_flush(int textured)
         tex.palette = s_gpu.texs[0].palette;
         tex.cube = s_gpu.texs[0].cube;
         tex.normalized = tex_size_from_format(tex.color);
+        tex.alpha_kill = (s_gpu.texs[0].control0 >> 2) & 1;
         batch.texture = &tex;
     }
     for (st = 0; st < 4; st++) {
@@ -2105,6 +2108,7 @@ static void backend_flush(int textured)
         o->levels = t->pitch ? 1 : t->levels; o->filter = t->filter;
         o->palette = t->palette; o->cube = t->cube;
         o->normalized = tex_size_from_format(t->color);
+        o->alpha_kill = (t->control0 >> 2) & 1;
         batch.stage[st] = o;
     }
     batch.rc = s_gpu.rc_seen ? &s_gpu.rc : NULL;
@@ -3299,7 +3303,12 @@ static int program_batch(void)
         for (i = 0; i + 2 < n; i += 3) TRI(i, i + 1, i + 2);
         break;
     case NV_PRIM_TRIANGLE_STRIP:
-        for (i = 0; i + 2 < n; i++) TRI(i, i + 1, i + 2);
+        /* Every second triangle of a strip runs the other way round; swap two
+         * of its corners so all keep the winding the title culls by. */
+        for (i = 0; i + 2 < n; i++) {
+            if (i & 1) TRI(i + 1, i, i + 2);
+            else       TRI(i, i + 1, i + 2);
+        }
         break;
     case NV_PRIM_TRIANGLE_FAN:
     case NV_PRIM_POLYGON:
@@ -4070,6 +4079,9 @@ static void tex_stage_method(uint32_t method, uint32_t param)
         break;
     case 0x1B24:                                  /* SET_TEXTURE_BORDER_COLOR */
         t->border = param;
+        break;
+    case 0x1B0C:                                  /* SET_TEXTURE_CONTROL0 */
+        t->control0 = param;
         break;
     default:
         break;
