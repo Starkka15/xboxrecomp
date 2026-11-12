@@ -15,6 +15,9 @@ target_link_libraries(xbox_input PUBLIC xbox_input_map)
 if(WIN32)
     # Mouse+keyboard pad (RECOMP_MKB) reads Win32 raw input.
     target_sources(xbox_input PRIVATE mkb_input.c)
+    # DualSense / DualShock 4 straight from HID: XInput cannot see them.
+    target_sources(xbox_input PRIVATE hid_sony.c)
+    target_link_libraries(xbox_input PUBLIC hid setupapi)
     # mingw-w64's libxinput.a imports XINPUT1_3.dll, the DirectX June 2010
     # redistributable: stock Windows 10/11 lacks it and the exe dies with
     # 0xC0000135 before main. Proton ships it, so only native Windows shows

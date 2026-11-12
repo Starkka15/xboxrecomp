@@ -257,6 +257,177 @@ static BOOL translate_obj_path(PXBOX_OBJECT_ATTRIBUTES ObjectAttributes,
     return xbox_translate_path(xbox_path, win_path, buf_size);
 }
 
+/* RECOMP_READ_OVERLAY: a directory of read overlays. When a title opens a
+ * file X and <dir>\X.ovl exists (X = the file's name, no directories), reads
+ * of X return the overlay's bytes for the spans it lists and the file's own
+ * bytes everywhere else. The game files stay untouched, and swapping the
+ * directory swaps the content: a port uses it to serve localized audio
+ * tracks inside movie files without rewriting them.
+ *
+ * .ovl (little-endian): "ROVL", u32 version 1, u32 span count, then count x
+ * {u64 file offset, u32 length, u32 0}, sorted and non-overlapping, then the
+ * span bytes in the same order. */
+typedef struct {
+    HANDLE h;           /* the title's handle; NULL = free slot */
+    HANDLE data;        /* the .ovl file */
+    uint32_t n;
+    uint64_t *off;      /* span file offsets */
+    uint32_t *len;
+    uint64_t *at;       /* where each span's bytes start in the .ovl */
+} OVERLAY;
+#define OVERLAY_MAX 16
+static OVERLAY s_overlay[OVERLAY_MAX];
+static volatile LONG s_overlay_used;
+static SRWLOCK s_overlay_lock = SRWLOCK_INIT;
+
+static BOOL overlay_read_at(HANDLE f, uint64_t pos, void *buf, DWORD n)
+{
+    OVERLAPPED ov;
+    DWORD got = 0;
+    memset(&ov, 0, sizeof ov);
+    ov.Offset = (DWORD)pos;
+    ov.OffsetHigh = (DWORD)(pos >> 32);
+    return ReadFile(f, buf, n, &got, &ov) && got == n;
+}
+
+static void overlay_free(OVERLAY *o)
+{
+    if (o->data) CloseHandle(o->data);
+    free(o->off);
+    free(o->len);
+    free(o->at);
+    memset(o, 0, sizeof *o);
+}
+
+static void overlay_drop(HANDLE h)
+{
+    int i;
+    if (!s_overlay_used) return;
+    AcquireSRWLockExclusive(&s_overlay_lock);
+    for (i = 0; i < OVERLAY_MAX; i++)
+        if (s_overlay[i].h == h) {
+            overlay_free(&s_overlay[i]);
+            InterlockedDecrement(&s_overlay_used);
+        }
+    ReleaseSRWLockExclusive(&s_overlay_lock);
+}
+
+static void overlay_attach(HANDLE h, const WCHAR *win_path)
+{
+    static int init;
+    static WCHAR dir[MAX_PATH];
+    WCHAR path[MAX_PATH * 2];
+    const WCHAR *base;
+    OVERLAY o;
+    uint8_t head[12];
+    uint32_t i;
+    uint64_t at;
+
+    /* A handle value is reused once closed; an entry left by a handle that
+     * never went through xbox_NtClose must not follow it to this file. */
+    overlay_drop(h);
+    if (!init) {
+        const char *e = getenv("RECOMP_READ_OVERLAY");
+        if (e)
+            MultiByteToWideChar(CP_UTF8, 0, e, -1, dir, MAX_PATH);
+        init = 1;
+    }
+    if (!dir[0]) return;
+    base = wcsrchr(win_path, L'\\');
+    base = base ? base + 1 : win_path;
+    _snwprintf(path, MAX_PATH * 2, L"%s\\%s.ovl", dir, base);
+    path[MAX_PATH * 2 - 1] = 0;
+
+    memset(&o, 0, sizeof o);
+    o.data = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                         FILE_ATTRIBUTE_NORMAL, NULL);
+    if (o.data == INVALID_HANDLE_VALUE) return;
+    if (!overlay_read_at(o.data, 0, head, sizeof head) || memcmp(head, "ROVL", 4)
+        || *(uint32_t *)(head + 4) != 1 || !*(uint32_t *)(head + 8)
+        || *(uint32_t *)(head + 8) > (1u << 20))
+        goto bad;
+    o.n = *(uint32_t *)(head + 8);
+    o.off = malloc(o.n * sizeof *o.off);
+    o.len = malloc(o.n * sizeof *o.len);
+    o.at = malloc(o.n * sizeof *o.at);
+    {
+        uint8_t *t = malloc((size_t)o.n * 16);
+        if (!o.off || !o.len || !o.at || !t || !overlay_read_at(o.data, 12, t, o.n * 16)) {
+            free(t);
+            goto bad;
+        }
+        at = 12 + (uint64_t)o.n * 16;
+        for (i = 0; i < o.n; i++) {
+            o.off[i] = *(uint64_t *)(t + i * 16);
+            o.len[i] = *(uint32_t *)(t + i * 16 + 8);
+            o.at[i] = at;
+            at += o.len[i];
+            if (i && o.off[i] < o.off[i - 1] + o.len[i - 1]) {
+                free(t);
+                goto bad;           /* not sorted, or overlapping */
+            }
+        }
+        free(t);
+    }
+    o.h = h;
+    AcquireSRWLockExclusive(&s_overlay_lock);
+    for (i = 0; i < OVERLAY_MAX && s_overlay[i].h; i++) {}
+    if (i < OVERLAY_MAX) {
+        s_overlay[i] = o;
+        InterlockedIncrement(&s_overlay_used);
+    }
+    ReleaseSRWLockExclusive(&s_overlay_lock);
+    if (i == OVERLAY_MAX) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "read overlay table full, %S not applied", path);
+        overlay_free(&o);
+        return;
+    }
+    xbox_log(XBOX_LOG_INFO, XBOX_LOG_FILE, "read overlay %S (%u spans)", path, o.n);
+    return;
+bad:
+    xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "read overlay %S is not valid, ignored", path);
+    overlay_free(&o);
+}
+
+/* Replace the overlaid parts of buf, which holds got bytes read at pos. */
+static void overlay_apply(HANDLE h, uint64_t pos, uint8_t *buf, DWORD got)
+{
+    int k;
+    if (!s_overlay_used || !got) return;
+    AcquireSRWLockShared(&s_overlay_lock);
+    for (k = 0; k < OVERLAY_MAX; k++) {
+        OVERLAY *o = &s_overlay[k];
+        uint32_t lo = 0, hi;
+        uint64_t end = pos + got;
+        if (o->h != h) continue;
+        /* First span ending after pos. */
+        hi = o->n;
+        while (lo < hi) {
+            uint32_t mid = (lo + hi) / 2;
+            if (o->off[mid] + o->len[mid] <= pos) lo = mid + 1; else hi = mid;
+        }
+        for (; lo < o->n && o->off[lo] < end; lo++) {
+            uint64_t a = o->off[lo] > pos ? o->off[lo] : pos;
+            uint64_t b = o->off[lo] + o->len[lo] < end ? o->off[lo] + o->len[lo] : end;
+            if (!overlay_read_at(o->data, o->at[lo] + (a - o->off[lo]), buf + (a - pos), (DWORD)(b - a)))
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE, "read overlay: short read");
+        }
+        break;
+    }
+    ReleaseSRWLockShared(&s_overlay_lock);
+}
+
+static int overlay_has(HANDLE h)
+{
+    int k, found = 0;
+    if (!s_overlay_used) return 0;
+    AcquireSRWLockShared(&s_overlay_lock);
+    for (k = 0; k < OVERLAY_MAX && !found; k++)
+        found = s_overlay[k].h == h;
+    ReleaseSRWLockShared(&s_overlay_lock);
+    return found;
+}
+
 NTSTATUS __stdcall xbox_NtCreateFile(
     PHANDLE FileHandle, ACCESS_MASK DesiredAccess,
     PXBOX_OBJECT_ATTRIBUTES ObjectAttributes, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
@@ -400,6 +571,10 @@ NTSTATUS __stdcall xbox_NtCreateFile(
     }
 
     *FileHandle = h;
+    if (!(CreateOptions & XBOX_FILE_DIRECTORY_FILE))
+        overlay_attach(h, win_path);
+    else
+        overlay_drop(h);
     if (IoStatusBlock) {
         IoStatusBlock->Status = STATUS_SUCCESS;
         IoStatusBlock->Information = (CreateDisposition == XBOX_FILE_CREATE) ? 2 : 1;
@@ -422,16 +597,27 @@ NTSTATUS __stdcall xbox_NtReadFile(
         return STATUS_INVALID_PARAMETER;
 
     overwrite_settle(FileHandle);
+    int overlaid = overlay_has(FileHandle);
+    LARGE_INTEGER pos;
+    pos.QuadPart = 0;
     if (ByteOffset && ByteOffset->QuadPart >= 0) {
         memset(&ov, 0, sizeof(ov));
         ov.Offset = ByteOffset->LowPart;
         ov.OffsetHigh = ByteOffset->HighPart;
+        pos = *ByteOffset;
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, &ov);
     } else {
+        if (overlaid) {
+            LARGE_INTEGER zero;
+            zero.QuadPart = 0;
+            SetFilePointerEx(FileHandle, zero, &pos, FILE_CURRENT);
+        }
         result = ReadFile(FileHandle, Buffer, Length, &bytes_read, NULL);
     }
 
     if (result || GetLastError() == ERROR_HANDLE_EOF) {
+        if (overlaid)
+            overlay_apply(FileHandle, (uint64_t)pos.QuadPart, (uint8_t *)Buffer, bytes_read);
         IoStatusBlock->Information = bytes_read;
         if (bytes_read == 0 && Length > 0) {
             IoStatusBlock->Status = STATUS_END_OF_FILE;
@@ -511,6 +697,7 @@ NTSTATUS __stdcall xbox_NtClose(HANDLE Handle)
     if (Handle && Handle != INVALID_HANDLE_VALUE) {
         overwrite_settle(Handle);
         xbox_dir_context_drop(Handle);
+        overlay_drop(Handle);
         CloseHandle(Handle);
         return STATUS_SUCCESS;
     }
