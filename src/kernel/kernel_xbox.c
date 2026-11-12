@@ -215,6 +215,16 @@ ULONG xbox_VideoSetting(void)
     return XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
 }
 
+/* XC_LANGUAGE (XGetLanguage): 1 English, 2 Japanese, 3 German, 4 French,
+ * 5 Spanish, 6 Italian, 7 Korean, 8 Chinese, 9 Portuguese. RECOMP_LANGUAGE
+ * sets it; English otherwise. */
+static ULONG xbox_LanguageSetting(void)
+{
+    const char *e = getenv("RECOMP_LANGUAGE");
+    ULONG v = e && *e ? strtoul(e, NULL, 0) : 1;
+    return v >= 1 && v <= 9 ? v : 1;
+}
+
 NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     ULONG ValueIndex, PULONG Type, PVOID Value, ULONG ValueLength, PULONG ResultLength)
 {
@@ -225,11 +235,24 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
     xbox_log(XBOX_LOG_DEBUG, XBOX_LOG_XBOX,
         "ExQueryNonVolatileSetting: index=0x%02X len=%u", ValueIndex, ValueLength);
 
+    /* XC_FACTORY_AV_REGION: XGetVideoStandard returns its second byte (1 NTSC-M,
+     * 2 NTSC-J, 3 PAL-I), and titles that only localize on a PAL console key
+     * their language handling on it. RECOMP_AV_REGION gives the whole dword,
+     * e.g. 0x00800300 for a PAL console; unset, the query stays unhandled
+     * (zeroes) as before. */
+    if (ValueIndex == XC_FACTORY_AV_REGION && getenv("RECOMP_AV_REGION") && *getenv("RECOMP_AV_REGION")) {
+        if (ValueLength >= sizeof(ULONG)) {
+            *(PULONG)Value = strtoul(getenv("RECOMP_AV_REGION"), NULL, 0);
+            if (Type) *Type = 4;
+            if (ResultLength) *ResultLength = sizeof(ULONG);
+        }
+        return STATUS_SUCCESS;
+    }
+
     switch (ValueIndex) {
     case XC_LANGUAGE:
-        /* English = 1 */
         if (ValueLength >= sizeof(ULONG)) {
-            *(PULONG)Value = 1;
+            *(PULONG)Value = xbox_LanguageSetting();
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }
@@ -328,7 +351,7 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         memcpy(blk + 0x1C, &s_tz.dlt_date, 4);
         memcpy(blk + 0x28, &s_tz.std_bias, 4);
         memcpy(blk + 0x2C, &s_tz.dlt_bias, 4);
-        { ULONG v = 1; memcpy(blk + 0x30, &v, 4); }                       /* English */
+        { ULONG v = xbox_LanguageSetting(); memcpy(blk + 0x30, &v, 4); }
         { ULONG v = xbox_VideoSetting(); memcpy(blk + 0x34, &v, 4); }
         /* 0x58 is MiscFlags (0); DvdRegion is the last field, at 0x5C. */
         { ULONG v = 1; memcpy(blk + 0x5C, &v, 4); }                       /* DVD region 1 */

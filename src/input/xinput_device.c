@@ -13,6 +13,7 @@
 #include "xinput_xbox.h"
 #include "keyboard.h"
 #include "mkb_input.h"
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -55,6 +56,7 @@ static void keyboard_merge(XBOX_INPUT_STATE *pState)
 
 #include <xinput.h>
 #pragma comment(lib, "xinput.lib")
+#include "hid_sony.h"
 
 static BOOL  g_controller_connected[XBOX_MAX_CONTROLLERS] = { FALSE };
 static DWORD g_last_packet[XBOX_MAX_CONTROLLERS] = { 0 };
@@ -87,16 +89,44 @@ static DWORD slot_state(DWORD slot, XINPUT_STATE *st)
     return ERROR_SUCCESS;
 }
 
+/* The Sony pad (hid_sony.c) behind each port, or -1 for an XInput one.
+ * Sony pads come after the XInput pads. */
+static int g_port_sony[XBOX_MAX_CONTROLLERS] = { -1, -1, -1, -1 };
+
+/* Diagnostics: which device a port reads, each time it changes
+ * (XInput slot n, Sony pad 100 + id, -1 none). */
+static void port_trace(DWORD port, int src)
+{
+    static int last[XBOX_MAX_CONTROLLERS] = { -2, -2, -2, -2 };
+    if (last[port] == src)
+        return;
+    last[port] = src;
+    if (src < 0)
+        fprintf(stderr, "  [input] port %lu: no pad", (unsigned long)port);
+    else if (src >= 100)
+        fprintf(stderr, "  [input] port %lu: Sony pad %d", (unsigned long)port, src - 100);
+    else
+        fprintf(stderr, "  [input] port %lu: XInput slot %d", (unsigned long)port, src);
+    fputc(10, stderr);
+}
+
 static DWORD port_state(DWORD port, XINPUT_STATE *st)
 {
     DWORD slot, n = 0;
+    int id;
     for (slot = 0; slot < XBOX_MAX_CONTROLLERS; slot++) {
         if (slot_state(slot, st) != ERROR_SUCCESS)
             continue;
-        if (n++ == port)
+        if (n++ == port) {
+            g_port_sony[port] = -1;
+            port_trace(port, (int)slot);
             return ERROR_SUCCESS;
+        }
     }
-    return ERROR_DEVICE_NOT_CONNECTED;
+    id = sony_get((int)(port - n), st);
+    g_port_sony[port] = id;
+    port_trace(port, id >= 0 ? 100 + id : -1);
+    return id >= 0 ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
 /* For rumble: the slot behind a port, or -1. */
@@ -111,6 +141,7 @@ static int port_slot(DWORD port)
 
 void xbox_InputInit(void)
 {
+    sony_init();
     for (DWORD i = 0; i < XBOX_MAX_CONTROLLERS; i++) {
         XINPUT_STATE state;
         g_slot_checked[i] = GetTickCount() - 1000;
@@ -199,6 +230,10 @@ DWORD xbox_InputSetState(DWORD dwPort, const XBOX_VIBRATION *pVibration)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pVibration)
         return ERROR_DEVICE_NOT_CONNECTED;
+    if (g_port_sony[dwPort] >= 0) {
+        sony_rumble(g_port_sony[dwPort], pVibration->wLeftMotorSpeed, pVibration->wRightMotorSpeed);
+        return ERROR_SUCCESS;
+    }
     slot = port_slot(dwPort);
     if (slot < 0)
         return ERROR_DEVICE_NOT_CONNECTED;
@@ -228,8 +263,14 @@ DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILI
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pCaps)
         return ERROR_DEVICE_NOT_CONNECTED;
 
-    if (port_slot(dwPort) < 0)
-        return ERROR_DEVICE_NOT_CONNECTED;
+    if (port_slot(dwPort) < 0) {
+        if (g_port_sony[dwPort] < 0)
+            return ERROR_DEVICE_NOT_CONNECTED;
+        memset(pCaps, 0, sizeof(XBOX_INPUT_CAPABILITIES));
+        pCaps->Type = XINPUT_DEVTYPE_GAMEPAD;
+        pCaps->SubType = XINPUT_DEVSUBTYPE_GAMEPAD;
+        return ERROR_SUCCESS;
+    }
     result = XInputGetCapabilities((DWORD)port_slot(dwPort), dwFlags, &xi_caps);
     if (result != ERROR_SUCCESS) return result;
 

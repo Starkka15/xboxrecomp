@@ -400,6 +400,10 @@ static void mkb_handle_raw(HRAWINPUT h)
             vk = (k->Flags & RI_KEY_E0) ? VK_RMENU : VK_LMENU;
         if (k->Message == WM_KEYDOWN || k->Message == WM_SYSKEYDOWN) {
             note_kb_activity();
+            if (!s_vk_down[vk & 0xFF] && game_is_foreground()) {
+                fprintf(stderr, "  [MKB] key %02X down", vk);
+                fputc(10, stderr);
+            }
             if (!s_vk_down[vk & 0xFF] && game_is_foreground())
                 InterlockedIncrement(&s_presses);
             if (vk && vk < 256)
