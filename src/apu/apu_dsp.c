@@ -25,6 +25,7 @@
 #include "apu_state.h"
 #include "fpconv.h"
 
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -229,6 +230,8 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d)
     (void)d;
 }
 
+static double s_binstat_out[2];          /* RECOMP_APU_BINSTAT: output L/R power */
+
 void mcpx_apu_dsp_frame(MCPXAPUState *d,
                          float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -247,6 +250,38 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
      */
 
     int off = (d->ep_frame_div % 8) * NUM_SAMPLES_PER_FRAME;
+
+    /* RECOMP_APU_BINSTAT=1: every ~5 s, the RMS level of each mixbin that
+     * carried anything, so a title's routing can be read off the log. */
+    {
+        static int on = -1;
+        static double acc[NUM_MIXBINS];
+        static unsigned frames;
+        if (on < 0) {
+            const char *e = getenv("RECOMP_APU_BINSTAT");
+            on = e && *e && *e != '0';
+        }
+        if (on) {
+            for (int b = 0; b < NUM_MIXBINS; b++)
+                for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+                    acc[b] += (double)mixbins[b][i] * mixbins[b][i];
+            if (++frames == 7500) {        /* 48000 / 32 * 5 */
+                char line[1024];
+                double ns = frames * (double)NUM_SAMPLES_PER_FRAME;
+                int n = snprintf(line, sizeof line, "[APU-BINSTAT] out L=%.4f R=%.4f bins:",
+                                 sqrt(s_binstat_out[0] / ns), sqrt(s_binstat_out[1] / ns));
+                s_binstat_out[0] = s_binstat_out[1] = 0;
+                for (int b = 0; b < NUM_MIXBINS && n < (int)sizeof line - 24; b++) {
+                    double rms = sqrt(acc[b] / (frames * (double)NUM_SAMPLES_PER_FRAME));
+                    if (rms > 1e-5)
+                        n += snprintf(line + n, sizeof line - n, " %d=%.4f", b, rms);
+                    acc[b] = 0;
+                }
+                fprintf(stderr, "%s\n", line);
+                frames = 0;
+            }
+        }
+    }
 
     if (d->monitor.point != MCPX_APU_DEBUG_MON_VP) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
@@ -273,17 +308,30 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Gating the HRTF submix override was tried first and did not fix
              * it, so the defect is the width of this mixdown and nothing else.
              *
-             * Even bins left, odd bins right, which preserves the stereo
-             * pairing the guest set up -- bins 6/7 and 8/9 arrive with matched
-             * counts. This is not what a real EP does; it is the cheapest
-             * mixdown that stops discarding audio. */
+             * This is not what a real EP does; it is the cheapest mixdown
+             * that stops discarding audio. The speaker split is below. */
             float left, right;
             if (mcpx_apu_mixdown_all()) {
+                /* The bins follow the XDK's DSMIXBIN layout, so the split
+                 * is by speaker, not by parity: 0 front left, 1 front
+                 * right, 2 center, 3 LFE, 4/5 back left/right, 6-9 the
+                 * crosstalk pairs (L, R, L, R), 10 the I3DL2 reverb send
+                 * and 11-31 the GP effect sends. A parity split put center
+                 * on the left and LFE on the right; A Hero's Tail sends
+                 * its menu and gameplay audio to LFE at almost the front
+                 * level, so the right side came out about twice as loud.
+                 * Center and the sends, which have no side, go to both at
+                 * -3 dB. LFE is left out, as in a stereo downmix. */
                 left = 0.0f;
                 right = 0.0f;
                 for (int b = 0; b < NUM_MIXBINS; ++b) {
-                    if (b & 1) right += mixbins[b][i];
-                    else       left  += mixbins[b][i];
+                    float s = mixbins[b][i];
+                    switch (b) {
+                    case 0: case 4: case 6: case 8: left  += s; break;
+                    case 1: case 5: case 7: case 9: right += s; break;
+                    case 3: break;
+                    default: left += 0.7071f * s; right += 0.7071f * s; break;
+                    }
                 }
             } else {
                 left = mixbins[0][i];
@@ -299,6 +347,8 @@ void mcpx_apu_dsp_frame(MCPXAPUState *d,
              * Each of the 8 sub-frames writes its own 32-sample slice. */
             d->monitor.frame_buf[off + i][0] = (int16_t)(left * 32767.0f);
             d->monitor.frame_buf[off + i][1] = (int16_t)(right * 32767.0f);
+            s_binstat_out[0] += (double)left * left;
+            s_binstat_out[1] += (double)right * right;
         }
     }
 

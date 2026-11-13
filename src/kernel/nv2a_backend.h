@@ -112,6 +112,20 @@ typedef struct {
     uint32_t poly_offset_fill;
     float    poly_offset_factor, poly_offset_units;
     uint32_t control0;          /* SET_CONTROL0 (0x0290): Z_FORMAT float, Z_PERSPECTIVE (w-buffer) */
+    /* SET_WINDOW_CLIP_TYPE (0x02B4) and the first SET_WINDOW_CLIP_HORIZONTAL/
+     * VERTICAL pair (0x02C0/0x02E0): xmin | xmax << 16, ymin | ymax << 16,
+     * inclusive, in surface pixels before anti-aliasing. Type 0 draws only
+     * inside the rectangle. XDK D3D programs it from the viewport, so a title
+     * drawing a model into a box on screen (a shop portrait) relies on it to
+     * cut the model at the box's edges. Both zero: no clip. */
+    uint32_t window_clip_type, window_clip_h, window_clip_v;
+    /* SET_SURFACE_CLIP_HORIZONTAL/VERTICAL as a rectangle in real
+     * (anti-aliased) surface pixels. Nv2aSurface carries only its width and
+     * height, which back ends use as the surface size; the origin is here.
+     * xemu scissors every draw to it. A Hero's Tail narrows it to the shop's
+     * portrait box while drawing Moneybags, and that's what keeps him inside
+     * the box. */
+    uint32_t surface_clip_x, surface_clip_y, surface_clip_w, surface_clip_h;
 } Nv2aRenderState;
 
 /* A batch whose vertex program the back end runs itself. verts holds nverts

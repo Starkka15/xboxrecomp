@@ -838,6 +838,13 @@ static void current_render_state(Nv2aRenderState *r)
     r->poly_offset_factor = reg_f(0x0384);           /* SET_POLYGON_OFFSET_SCALE_FACTOR */
     r->poly_offset_units = reg_f(0x0388);            /* SET_POLYGON_OFFSET_BIAS */
     r->control0          = s_reg[0x0290 / 4];        /* SET_CONTROL0 */
+    r->window_clip_type  = s_reg[0x02B4 / 4];        /* SET_WINDOW_CLIP_TYPE */
+    r->window_clip_h     = s_reg[0x02C0 / 4];        /* SET_WINDOW_CLIP_HORIZONTAL(0) */
+    r->window_clip_v     = s_reg[0x02E0 / 4];        /* SET_WINDOW_CLIP_VERTICAL(0) */
+    r->surface_clip_x    = s_gpu.clip_x;             /* SET_SURFACE_CLIP_*, AA-scaled */
+    r->surface_clip_y    = s_gpu.clip_y;
+    r->surface_clip_w    = s_gpu.clip_w;
+    r->surface_clip_h    = s_gpu.clip_h;
 }
 
 static int sample_texture(uint32_t u, uint32_t v, uint32_t *argb);
